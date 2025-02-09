@@ -96,6 +96,10 @@ pub struct Request {
 }
 
 impl<S: request_builder::State> RequestBuilder<S> {
+    pub fn messages(mut self, messages: impl IntoIterator<Item = impl Into<Message>>) -> Self {
+        self.messages = messages.into_iter().map(Into::into).collect();
+        self
+    }
     pub fn message(mut self, message: impl Into<Message>) -> Self {
         self.messages.push(message.into());
         self
