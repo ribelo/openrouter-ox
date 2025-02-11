@@ -1,12 +1,13 @@
 use bon::Builder;
-use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_stream::Stream;
 
 use crate::{
     message::{Message, Messages},
     provider_preference::ProviderPreferences,
-    tool::ToolChoice,
+    response::{ChatCompletionChunk, ChatCompletionResponse},
+    tool::{ToolBox, ToolChoice},
     ApiRequestError, ErrorResponse, OpenRouter, BASE_URL,
 };
 
@@ -50,13 +51,11 @@ pub struct Request {
     #[builder(into)]
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Value>,
+    pub tools: Option<ToolBox>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,10 +109,8 @@ impl Request {
     pub fn push_message(&mut self, message: impl Into<Message>) {
         self.messages.push(message.into());
     }
-    pub async fn send(&self) -> Result<Value, ApiRequestError> {
+    pub async fn send(&self) -> Result<ChatCompletionResponse, ApiRequestError> {
         let url = format!("{}/{}", BASE_URL, API_URL);
-        let _body = serde_json::to_string(self)?;
-        dbg!(&_body);
         let req = self
             .open_router
             .client
@@ -123,86 +120,51 @@ impl Request {
                 format!("Bearer {}", self.open_router.api_key),
             )
             .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "YOUR_SITE_URL")
-            .header("X-Title", "YOUR_SITE_NAME")
             .json(self);
-        dbg!(&req);
-        let res = req.send().await?;
-        dbg!(&res);
-        let value = res.json().await?;
-        Ok(value)
-        // if res.status().is_success() {
-        //     let data: ChatCompletionResponse = res.json().await?;
-        //     Ok(data)
-        // } else {
-        //     let error_response: ErrorResponse = res.json().await?;
-        //     Err(ApiRequestError::InvalidRequestError {
-        //         message: error_response.error.message,
-        //         param: error_response.error.param,
-        //         code: error_response.error.code,
-        //     })
-        // }
+        let res = req.send().await.unwrap();
+        if res.status().is_success() {
+            let text = res.text().await.unwrap();
+            let data: crate::response::ChatCompletionResponse = serde_json::from_str(&text).unwrap();
+            Ok(data)
+        } else {
+            let error_response: ErrorResponse = res.json().await?;
+            Err(ApiRequestError::InvalidRequestError(error_response))
+        }
     }
 
-    // pub async fn stream(
-    //     &self,
-    // ) -> impl Stream<Item = Result<ChatCompletionChunkResponse, ApiRequestError>> {
-    //     let url = format!("{}/{}", BASE_URL, API_URL);
-    //     let mut body = serde_json::to_value(self).unwrap();
-    //     body["stream"] = serde_json::Value::Bool(true);
+    pub async fn stream(
+        &self,
+    ) -> impl tokio_stream::Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> {
+        use tokio_stream::StreamExt;
+        let url = format!("{}/{}", BASE_URL, API_URL);
+        let mut body = serde_json::to_value(self).unwrap();
+        body["stream"] = serde_json::Value::Bool(true);
 
-    //     let stream = self
-    //         .openai
-    //         .client
-    //         .post(url)
-    //         .bearer_auth(&self.openai.api_key)
-    //         .json(&body)
-    //         .send()
-    //         .await
-    //         .unwrap()
-    //         .bytes_stream();
+        let response = self
+            .open_router
+            .client
+            .post(&url)
+            .bearer_auth(&self.open_router.api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let byte_stream = response.bytes_stream();
 
-    //     let filtered_stream = stream.flat_map(|chunk| {
-    //         let chunk = match chunk {
-    //             Ok(bytes) => String::from_utf8(bytes.to_vec())
-    //                 .map_err(|e| ApiRequestError::Stream(e.to_string())),
-    //             Err(e) => Err(ApiRequestError::Stream(e.to_string())),
-    //         };
+        let parsed_stream = byte_stream.filter_map(move |chunk_result| {
+            let chunk = match chunk_result {
+                Ok(bytes) => bytes,
+                Err(e) => return Some(Err(ApiRequestError::Stream(e.to_string()))),
+            };
+            let chunk_str = match String::from_utf8(chunk.to_vec()) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(ApiRequestError::Stream(e.to_string()))),
+            };
+            ChatCompletionChunk::from_streaming_line(&chunk_str)
+        });
 
-    //         let responses = chunk
-    //             .map(|data| match data.as_str() {
-    //                 "" => vec![],
-    //                 s if s.starts_with("data: ") => s
-    //                     .split("\n\n")
-    //                     .filter(|chunk| !chunk.is_empty() && chunk != &"data: [DONE]")
-    //                     .filter_map(|chunk| chunk.strip_prefix("data: "))
-    //                     .map(|json_str| {
-    //                         serde_json::from_str::<ChatCompletionChunkResponse>(json_str)
-    //                             .map_err(ApiRequestError::SerdeError)
-    //                     })
-    //                     .filter(|res| {
-    //                         res.as_ref().is_ok_and(|res| {
-    //                             !res.choices.iter().any(|choice| {
-    //                                 choice.delta.content.as_ref().is_some_and(|s| {
-    //                                     dbg!(s);
-    //                                     dbg!(s.is_empty())
-    //                                 })
-    //                             })
-    //                         })
-    //                     })
-    //                     .collect(),
-    //                 _ => vec![Err(ApiRequestError::Stream(format!(
-    //                     "Invalid event data: {}",
-    //                     data
-    //                 )))],
-    //             })
-    //             .unwrap_or_else(|e| vec![Err(e)]);
-
-    //         futures::stream::iter(responses)
-    //     });
-
-    //     Box::pin(filtered_stream)
-    // }
+        Box::pin(parsed_stream)
+    }
 }
 
 // impl TokenCount for Message {
@@ -231,10 +193,13 @@ impl OpenRouter {
 #[cfg(test)]
 mod test {
 
-    use futures::StreamExt;
+    use serde::Deserialize;
+    use serde_json::json;
+    use tokio_stream::StreamExt;
 
     use crate::{
-        message::{Message, UserMessage},
+        message::{Message, Messages, UserMessage},
+        tool::{Tool, ToolBox},
         OpenRouter,
     };
 
@@ -262,9 +227,7 @@ mod test {
             .await
             .unwrap();
 
-        dbg!(&response);
         let json = response.json::<serde_json::Value>().await.unwrap();
-        dbg!(json);
     }
 
     #[tokio::test]
@@ -277,113 +240,286 @@ mod test {
             .build();
         let res = openrouter
             .chat_completion()
-            .model("anthropic/claude-3.5-sonnet:beta")
+            .model("google/gemini-2.0-flash-001")
             .message(UserMessage::from(vec!["Hi, I'm John."]))
             .build()
             .send()
             .await;
-        // dbg!(&res);
+        dbg!(&res);
     }
 
-    // #[tokio::test]
-    // async fn test_chat_stream() {
-    //     let api_key = std::env::var("OPENAI_API_KEY").unwrap();
-    //     let client = reqwest::Client::new();
-    //     let openai = OpenAi::builder().api_key(api_key).client(client).build();
-    //     let mut res = openai
-    //         .chat_completion()
-    //         .model("gpt-4o")
-    //         .stream(true)
-    //         .messages(Message::user("Hi, I'm John."))
-    //         .build()
-    //         .stream()
-    //         .await;
-    //     while let Some(res) = res.next().await {
-    //         dbg!(String::from(res.unwrap()));
-    //     }
-    // }
+    #[tokio::test]
+    async fn test_chat_stream() {
+        let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+        let client = reqwest::Client::new();
+        let openai = OpenRouter::builder()
+            .api_key(api_key)
+            .client(client)
+            .build();
+        let mut res = openai
+            .chat_completion()
+            .model("anthropic/claude-3.5-sonnet:beta")
+            .message(UserMessage::from(vec!["Hi, I'm John."]))
+            .build()
+            .stream()
+            .await;
+        while let Some(res) = res.next().await {
+            dbg!(res);
+        }
+    }
 
-    // // #[cfg(feature = "tools")]
-    // // #[tokio::test]
-    // // async fn test_wikipedia_tool() {
-    // //     #[derive(Debug)]
-    // //     pub struct Wikipedia;
+    #[tokio::test]
+    async fn test_openai() {
+        // let payload = json!({
+        //       "messages": [
+        //         {
+        //           "role": "user",
+        //           "content": "This is a test, use adding tool to verify if everything is working."
+        //         },
+        //         {
+        //           "role": "assistant",
+        //           "content": null,
+        //           "function_call": {
+        //             "name": "adding_tool",
+        //             "arguments": "{\"a\":5,\"b\":7}"
+        //           }
+        //         },
+        //         {
+        //           "role": "function",
+        //           "name": "adding_tool",
+        //           "content": "{\"result\":12.0}"
+        //         }
+        //       ],
+        //       "model": "openai/gpt-4o-2024-11-20",
+        //       "tools": [
+        //         {
+        //           "type": "function",
+        //           "function": {
+        //             "name": "adding_tool",
+        //             "parameters": {
+        //               "$schema": "https://json-schema.org/draft/2020-12/schema",
+        //               "properties": {
+        //                 "a": { "format": "float", "type": "number" },
+        //                 "b": { "format": "float", "type": "number" }
+        //               },
+        //               "required": [ "a", "b" ],
+        //               "type": "object"
+        //             }
+        //           }
+        //         }
+        //       ]
+        // });
+        let payload = json!({
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "This is a test, use adding tool to verify if everything is working."
+                }
+              ]
+            },
+            {
+              "role": "assistant",
+              "content": "",
+              "tool_calls": [
+                {
+                  "id": "call_sJgwcXOX1wXbylui3t53YFU6",
+                  "type": "function",
+                  "function": {
+                    "name": "adding_tool",
+                    "arguments": "{\"a\":5,\"b\":7}"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": "{\"result\":12.0}",
+              "tool_call_id": "call_sJgwcXOX1wXbylui3t53YFU6"
+            }
+          ],
+          "model": "openai/gpt-4o-2024-11-20",
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "adding_tool",
+                "parameters": {
+                  "$schema": "https://json-schema.org/draft/2020-12/schema",
+                  "properties": {
+                    "a": {
+                      "format": "float",
+                      "type": "number"
+                    },
+                    "b": {
+                      "format": "float",
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "a",
+                    "b"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        });
 
-    // //     #[async_trait::async_trait]
-    // //     impl ToTool for Wikipedia {
-    // //         fn to_tool(&self) -> Tool {
-    // //             ToolBuilder::default()
-    // //                 .name("wikipedia")
-    // //                 .description("Search in wikipedia")
-    // //                 .add_parameter::<String>("query", "Query")
-    // //                 .build()
-    // //                 .unwrap()
-    // //         }
-    // //         async fn call_tool(
-    // //             &self,
-    // //             tool_call_id: &str,
-    // //             input: serde_json::Value,
-    // //         ) -> ToolCallResult {
-    // //             dbg!(&input);
-    // //             let query = input["query"].as_str().unwrap();
-    // //             let url = format!("https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={}", query);
-    // //             let res = reqwest::get(&url)
-    // //                 .await
-    // //                 .unwrap()
-    // //                 .json::<serde_json::Value>()
-    // //                 .await
-    // //                 .unwrap();
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+        let client = reqwest::Client::new();
 
-    // //             ToolCallResult {
-    // //                 tool_call_id: tool_call_id.to_string(),
-    // //                 content: res.to_string(),
-    // //             }
-    // //         }
-    // //     }
+        let response = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
 
-    // //     let api_key = std::env::var("OPENAI_API_KEY").unwrap();
-    // //     let client = reqwest::Client::new();
-    // //     let openai = OpenAiBuilder::default()
-    // //         .api_key(api_key)
-    // //         .client(&client)
-    // //         .build()
-    // //         .unwrap();
-    // //     let tools = Tools::default().add_tool(Wikipedia);
-    // //     let mut messages = Messages::from(Message::user("Search Apollo project on Wikipedia."));
-    // //     let res = openai
-    // //         .chat_completion()
-    // //         .model("gpt-4-1106-preview")
-    // //         .tools(tools.clone())
-    // //         .messages(messages.clone())
-    // //         .build()
-    // //         .unwrap()
-    // //         .send()
-    // //         .await
-    // //         .unwrap();
+        let json = response.json::<serde_json::Value>().await.unwrap();
+        dbg!(json);
 
-    // //     match &res.choices[0].message {
-    // //         Message::Assistant(msg) => {
-    // //             if let Some(tool_calls) = &msg.tool_calls {
-    // //                 let results = tools.call_tools(tool_calls).await;
-    // //                 let tool_msgs = Messages::from(results.clone());
-    // //                 messages.push_message(msg.clone());
-    // //                 messages.extend(tool_msgs.into_iter());
-    // //                 dbg!(&messages);
-    // //                 let res = openai
-    // //                     .chat_completion()
-    // //                     .model("gpt-4-1106-preview")
-    // //                     .tools(tools.clone())
-    // //                     .messages(messages.clone())
-    // //                     .build()
-    // //                     .unwrap()
-    // //                     .send()
-    // //                     .await
-    // //                     .unwrap();
+    }
 
-    // //                 dbg!(&res);
-    // //             }
-    // //         }
-    // //         _ => panic!("Not a tool call"),
-    // //     }
-    // // }
+    #[tokio::test]
+    async fn test_adding_tool() {
+        #[derive(Debug, Clone)]
+        pub struct AddingTool;
+
+        #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+        pub struct AddingToolInput {
+            a: f32,
+            b: f32,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for AddingTool {
+            type Input = AddingToolInput;
+            type Output = serde_json::Value;
+            type Error = String;
+
+            fn name(&self) -> &str {
+                "adding_tool"
+            }
+
+            async fn invoke(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
+                Ok(json!({"result": input.a + input.b}))
+            }
+        }
+
+        let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+        let client = reqwest::Client::new();
+        let openrouter = OpenRouter::builder()
+            .api_key(api_key)
+            .client(client)
+            .build();
+        let tools = ToolBox::builder().tool(AddingTool).build();
+        let mut messages = Messages::from(UserMessage::from(vec!["This is a test, use adding tool to verify if everything is working."]));
+        let res = openrouter
+            .chat_completion()
+            .model("openai/gpt-4o-2024-11-20")
+            .tools(tools.clone())
+            .messages(messages.clone())
+            .build()
+            .send()
+            .await
+            .unwrap();
+        messages.push(res.clone());
+        if let Some(tool_calls) = res.tool_calls() {
+            for tool_call in tool_calls {
+                let msg = tools.invoke(tool_call).await;
+                messages.push(msg);
+            }
+        }
+        let res = openrouter
+            .chat_completion()
+            .model("openai/gpt-4o-2024-11-20")
+            .tools(tools.clone())
+            .messages(messages)
+            .build()
+            .send()
+            .await
+            .unwrap();
+        dbg!(&res);
+
+
+    }
+
+    #[tokio::test]
+    async fn test_wikipedia_tool() {
+        #[derive(Debug, Clone)]
+        pub struct Wikipedia;
+
+        #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+        pub struct WikipediaInput {
+            query: String,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for Wikipedia {
+            type Input = WikipediaInput;
+            type Output = serde_json::Value;
+            type Error = String;
+
+            fn name(&self) -> &str {
+                "wikipedia"
+            }
+
+            async fn invoke(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
+                let url = format!(
+                            "https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={}",
+                            input.query
+                        );
+                let res = reqwest::get(&url)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(res)
+            }
+        }
+
+        let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+        let client = reqwest::Client::new();
+        let openrouter = OpenRouter::builder()
+            .api_key(api_key)
+            .client(client)
+            .build();
+        let tools = ToolBox::builder().tool(Wikipedia).build();
+        let mut messages = Messages::from(UserMessage::from(vec!["Search Apollo project on Wikipedia."]));
+        let res = openrouter
+            .chat_completion()
+            .model("openai/gpt-4o-2024-11-20")
+            .tools(tools.clone())
+            .messages(messages.clone())
+            .build()
+            .send()
+            .await
+            .unwrap();
+        messages.push(res.clone());
+        if let Some(tool_calls) = res.tool_calls() {
+            for tool_call in tool_calls {
+                let msg = tools.invoke(tool_call).await;
+                messages.push(msg);
+            }
+        }
+        let res = openrouter
+            .chat_completion()
+            .model("openai/gpt-4o-2024-11-20")
+            .tools(tools.clone())
+            .messages(messages)
+            .build()
+            .send()
+            .await
+            .unwrap();
+        dbg!(&res);
+
+
+    }
 }

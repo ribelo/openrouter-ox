@@ -7,6 +7,7 @@ pub mod provider_preference;
 pub mod request;
 pub mod response;
 pub mod tool;
+pub mod agent;
 const BASE_URL: &str = "https://openrouter.ai";
 
 #[cfg(feature = "leaky-bucket")]
@@ -36,10 +37,25 @@ impl fmt::Debug for OpenRouter {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ErrorResponse {
+pub struct ErrorDetail {
     pub code: i32,
     pub message: String,
-    pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ErrorResponse {
+    pub error: ErrorDetail,
+    pub user_id: Option<String>,
+}
+
+impl std::fmt::Display for ErrorResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Error {}: {} (user_id: {:?})",
+            self.error.code, self.error.message, self.user_id
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -49,12 +65,8 @@ pub enum ApiRequestError {
     #[error(transparent)]
     SerdeError(#[from] serde_json::Error),
 
-    #[error("Invalid request error: {message}")]
-    InvalidRequestError {
-        message: String,
-        param: Option<String>,
-        code: Option<String>,
-    },
+    #[error("Invalid request error: {0}")]
+    InvalidRequestError(ErrorResponse),
     #[error("Unexpected response from API: {response}")]
     UnexpectedResponse { response: String },
     #[error("Stream error: {0}")]

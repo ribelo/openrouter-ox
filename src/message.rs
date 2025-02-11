@@ -1,8 +1,9 @@
 use std::fmt;
 
 use bon::{builder, Builder};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+
+use crate::response::ToolCall;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -75,22 +76,27 @@ impl ImageContent {
     }
 }
 
-pub trait ChatMessage: Serialize + DeserializeOwned {
-    fn role(&self) -> Role;
-    fn content(&self) -> impl IntoIterator<Item = &ContentPart>;
-    fn content_mut(&mut self) -> impl IntoIterator<Item = &mut ContentPart>;
-    fn push_content(&mut self, content: impl Into<ContentPart>);
-    fn is_empty(&self) -> bool;
-    fn len(&self) -> usize;
-}
-
 #[derive(Debug, Serialize, Deserialize, derive_more::Display, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text(TextContent),
     Image(ImageContent),
-    // ToolUse(ToolUse),
-    // ToolResult(ToolResult),
+}
+
+impl ContentPart {
+    pub fn as_text(&self) -> Option<&TextContent> {
+        match self {
+            ContentPart::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn as_image(&self) -> Option<&ImageContent> {
+        match self {
+            ContentPart::Image(image) => Some(image),
+            _ => None,
+        }
+    }
 }
 
 impl<T: Into<String>> From<T> for ContentPart {
@@ -112,7 +118,7 @@ impl<T: Into<String>> From<T> for ContentPart {
     derive_more::Into,
     derive_more::IntoIterator,
 )]
-pub struct Content(Vec<ContentPart>);
+pub struct Content(pub Vec<ContentPart>);
 
 impl<T> FromIterator<T> for Content
 where
@@ -123,72 +129,110 @@ where
     }
 }
 
+impl From<String> for Content {
+    fn from(content: String) -> Self {
+        Self(vec![ContentPart::Text(TextContent { text: content })])
+    }
+}
+
+impl From<&str> for Content {
+    fn from(content: &str) -> Self {
+        Self(vec![ContentPart::Text(TextContent {
+            text: content.to_string(),
+        })])
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "lowercase")]
 pub struct SystemMessage {
-    role: Role,
     #[builder(into)]
     content: Content,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
 
-impl ChatMessage for SystemMessage {
-    fn role(&self) -> Role {
-        self.role
+impl SystemMessage {
+    pub fn content(&self) -> &Content {
+        &self.content
     }
 
-    fn content(&self) -> impl IntoIterator<Item = &ContentPart> {
-        self.content.0.iter()
+    pub fn content_mut(&mut self) -> &mut Content {
+        &mut self.content
     }
 
-    fn content_mut(&mut self) -> impl IntoIterator<Item = &mut ContentPart> {
-        self.content.0.iter_mut()
-    }
-
-    fn push_content(&mut self, content: impl Into<ContentPart>) {
+    pub fn push_content(&mut self, content: impl Into<ContentPart>) {
         self.content.push(content.into());
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.content.len()
+    }
+}
+
+impl SystemMessage {
+    pub fn new<T, U>(content: T) -> Self
+    where
+        T: IntoIterator<Item = U>,
+        U: Into<ContentPart>,
+    {
+        Self {
+            content: content.into_iter().map(Into::into).collect(),
+            name: None,
+        }
+    }
+}
+
+impl<T, U> From<T> for SystemMessage
+where
+    T: IntoIterator<Item = U>,
+    U: Into<ContentPart>,
+{
+    fn from(content: T) -> Self {
+        Self {
+            content: content.into_iter().map(Into::into).collect(),
+            name: None,
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct UserMessage {
-    #[builder(into)]
+    #[builder(field)]
     content: Content,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
 
-impl ChatMessage for UserMessage {
-    fn role(&self) -> Role {
-        Role::User
+impl<S: user_message_builder::State> UserMessageBuilder<S> {
+    pub fn part(mut self, p: impl Into<ContentPart>) -> Self {
+        self.content.push(p.into());
+        self
+    }
+}
+
+impl UserMessage {
+    pub fn content(&self) -> &Content {
+        &self.content
     }
 
-    fn content(&self) -> impl IntoIterator<Item = &ContentPart> {
-        self.content.0.iter()
+    pub fn content_mut(&mut self) -> &mut Content {
+        &mut self.content
     }
 
-    fn content_mut(&mut self) -> impl IntoIterator<Item = &mut ContentPart> {
-        self.content.0.iter_mut()
-    }
-
-    fn push_content(&mut self, content: impl Into<ContentPart>) {
+    pub fn push_content(&mut self, content: impl Into<ContentPart>) {
         self.content.push(content.into());
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.content.len()
     }
 }
@@ -223,11 +267,12 @@ where
 pub struct AssistantMessage {
     #[serde(default)]
     #[builder(into)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub content: Content,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<Value>>,
+    pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
 }
@@ -249,9 +294,31 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct ToolMessage {
+    #[builder(field)]
+    pub content: String,
     #[builder(into)]
-    pub content: Vec<ContentPart>,
     pub tool_call_id: String,
+}
+
+impl<S: tool_message_builder::State> ToolMessageBuilder<S> {
+    pub fn content(mut self, content: impl Into<String>) -> Self {
+        self.content = content.into();
+        self
+    }
+}
+
+impl ToolMessage {
+    fn content(&self) -> &String {
+        &self.content
+    }
+
+    fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.content.len()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -262,62 +329,6 @@ pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
     Tool(ToolMessage),
-}
-
-impl ChatMessage for Message {
-    fn role(&self) -> Role {
-        match self {
-            Message::System(_) => Role::System,
-            Message::User(_) => Role::User,
-            Message::Assistant(_) => Role::Assistant,
-            Message::Tool(_) => Role::Tool,
-        }
-    }
-
-    fn content(&self) -> impl IntoIterator<Item = &ContentPart> {
-        match self {
-            Message::System(msg) => &msg.content,
-            Message::User(msg) => &msg.content,
-            Message::Assistant(msg) => &msg.content,
-            Message::Tool(msg) => &msg.content,
-        }
-    }
-
-    fn content_mut(&mut self) -> impl IntoIterator<Item = &mut ContentPart> {
-        match self {
-            Message::System(msg) => &mut msg.content,
-            Message::User(msg) => &mut msg.content,
-            Message::Assistant(msg) => &mut msg.content,
-            Message::Tool(msg) => &mut msg.content,
-        }
-    }
-
-    fn push_content(&mut self, content: impl Into<ContentPart>) {
-        match self {
-            Message::System(msg) => msg.content.push(content.into()),
-            Message::User(msg) => msg.content.push(content.into()),
-            Message::Assistant(msg) => msg.content.push(content.into()),
-            Message::Tool(msg) => msg.content.push(content.into()),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            Message::System(msg) => msg.content.is_empty(),
-            Message::User(msg) => msg.content.is_empty(),
-            Message::Assistant(msg) => msg.content.is_empty(),
-            Message::Tool(msg) => msg.content.is_empty(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Message::System(msg) => msg.content.len(),
-            Message::User(msg) => msg.content.len(),
-            Message::Assistant(msg) => msg.content.len(),
-            Message::Tool(msg) => msg.content.len(),
-        }
-    }
 }
 
 impl From<SystemMessage> for Message {
@@ -338,6 +349,12 @@ impl From<AssistantMessage> for Message {
     }
 }
 
+impl From<ToolMessage> for Message {
+    fn from(message: ToolMessage) -> Self {
+        Message::Tool(message)
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -351,9 +368,45 @@ impl From<AssistantMessage> for Message {
 )]
 pub struct Messages(pub Vec<Message>);
 
+impl Messages {
+    pub fn push(&mut self, message: impl Into<Message>) {
+        self.0.push(message.into());
+    }
+}
+
 impl From<Message> for Messages {
     fn from(value: Message) -> Self {
         Messages(vec![value])
+    }
+}
+
+impl From<UserMessage> for Messages {
+    fn from(value: UserMessage) -> Self {
+        Messages(vec![Message::User(value)])
+    }
+}
+
+impl From<AssistantMessage> for Messages {
+    fn from(value: AssistantMessage) -> Self {
+        Messages(vec![Message::Assistant(value)])
+    }
+}
+
+impl From<SystemMessage> for Messages {
+    fn from(value: SystemMessage) -> Self {
+        Messages(vec![Message::System(value)])
+    }
+}
+
+impl From<ToolMessage> for Messages {
+    fn from(value: ToolMessage) -> Self {
+        Messages(vec![Message::Tool(value)])
+    }
+}
+
+impl FromIterator<Message> for Messages {
+    fn from_iter<I: IntoIterator<Item = Message>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
     }
 }
 
@@ -429,21 +482,14 @@ mod tests {
     #[test]
     fn test_tool_message_deserialization() {
         let json = json!({
-            "content": [{
-                "type": "text",
-                "text": "The temperature is 72F"
-            }],
+            "content": "The temperature is 72F",
             "role": "tool",
             "tool_call_id": "weather_123"
         });
 
         let msg: ToolMessage = serde_json::from_value(json).unwrap();
-        if let ContentPart::Text(text_content) = &msg.content[0] {
-            assert_eq!(text_content.text, "The temperature is 72F");
-            assert_eq!(msg.tool_call_id, "weather_123");
-        } else {
-            panic!("Expected text content");
-        }
+        assert_eq!(msg.content, "The temperature is 72F");
+        assert_eq!(msg.tool_call_id, "weather_123");
     }
 
     #[test]
