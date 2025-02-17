@@ -1,6 +1,7 @@
 use bon::Builder;
+use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio_stream::Stream;
 
 use crate::{
@@ -13,24 +14,11 @@ use crate::{
 
 const API_URL: &str = "api/v1/chat/completions";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename = "text")]
-pub struct TextType;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename = "json_object")]
-pub struct JsonType;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseFormat {
-    Text {
-        #[serde(rename = "type")]
-        r#type: TextType,
-    },
-    Json {
-        #[serde(rename = "type")]
-        r#type: JsonType,
-    },
+    Text,
+    JsonObject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,10 +31,11 @@ pub struct Prediction {
 pub struct Request {
     #[builder(field)]
     pub messages: Messages,
+    #[builder(field)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
     #[builder(into)]
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(into)]
     pub stop: Option<Vec<String>>,
@@ -103,6 +92,17 @@ impl<S: request_builder::State> RequestBuilder<S> {
         self.messages.push(message.into());
         self
     }
+    pub fn response_format<T: JsonSchema + Serialize>(mut self) -> Self {
+        let type_name = std::any::type_name::<T>().split("::").last().unwrap();
+        dbg!(std::any::type_name::<T>());
+        let json_schema = schema_for!(T);
+        let response_format = json!({
+            "type": "json_schema",
+            "json_schema": {"name": type_name, "schema": json_schema},
+        });
+        self.response_format = Some(response_format);
+        self
+    }
 }
 
 impl Request {
@@ -110,6 +110,8 @@ impl Request {
         self.messages.push(message.into());
     }
     pub async fn send(&self) -> Result<ChatCompletionResponse, ApiRequestError> {
+        let body = serde_json::to_value(self).unwrap();
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
         let url = format!("{}/{}", BASE_URL, API_URL);
         let req = self
             .open_router
@@ -124,7 +126,9 @@ impl Request {
         let res = req.send().await.unwrap();
         if res.status().is_success() {
             let text = res.text().await.unwrap();
-            let data: crate::response::ChatCompletionResponse = serde_json::from_str(&text).unwrap();
+            dbg!(&text);
+            let data: crate::response::ChatCompletionResponse =
+                serde_json::from_str(&text).unwrap();
             Ok(data)
         } else {
             let error_response: ErrorResponse = res.json().await?;
@@ -193,12 +197,13 @@ impl OpenRouter {
 #[cfg(test)]
 mod test {
 
-    use serde::Deserialize;
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use tokio_stream::StreamExt;
 
     use crate::{
-        message::{Message, Messages, UserMessage},
+        message::{Messages, UserMessage},
         tool::{Tool, ToolBox},
         OpenRouter,
     };
@@ -269,46 +274,31 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_response_format() {
+        #[derive(Debug, Clone, Serialize, JsonSchema)]
+        struct MyResult {
+            expresion: String,
+            result: String,
+        }
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+        let client = reqwest::Client::new();
+        let openrouter = OpenRouter::builder()
+            .api_key(api_key)
+            .client(client)
+            .build();
+        let res = openrouter
+            .chat_completion()
+            .model("openai/gpt-4o-2024-11-20")
+            .message(UserMessage::from(vec!["ile to jest 2+2"]))
+            .response_format::<MyResult>()
+            .build()
+            .send()
+            .await;
+        dbg!(&res);
+    }
+
+    #[tokio::test]
     async fn test_openai() {
-        // let payload = json!({
-        //       "messages": [
-        //         {
-        //           "role": "user",
-        //           "content": "This is a test, use adding tool to verify if everything is working."
-        //         },
-        //         {
-        //           "role": "assistant",
-        //           "content": null,
-        //           "function_call": {
-        //             "name": "adding_tool",
-        //             "arguments": "{\"a\":5,\"b\":7}"
-        //           }
-        //         },
-        //         {
-        //           "role": "function",
-        //           "name": "adding_tool",
-        //           "content": "{\"result\":12.0}"
-        //         }
-        //       ],
-        //       "model": "openai/gpt-4o-2024-11-20",
-        //       "tools": [
-        //         {
-        //           "type": "function",
-        //           "function": {
-        //             "name": "adding_tool",
-        //             "parameters": {
-        //               "$schema": "https://json-schema.org/draft/2020-12/schema",
-        //               "properties": {
-        //                 "a": { "format": "float", "type": "number" },
-        //                 "b": { "format": "float", "type": "number" }
-        //               },
-        //               "required": [ "a", "b" ],
-        //               "type": "object"
-        //             }
-        //           }
-        //         }
-        //       ]
-        // });
         let payload = json!({
           "messages": [
             {
@@ -383,7 +373,6 @@ mod test {
 
         let json = response.json::<serde_json::Value>().await.unwrap();
         dbg!(json);
-
     }
 
     #[tokio::test]
@@ -400,15 +389,18 @@ mod test {
         #[async_trait::async_trait]
         impl Tool for AddingTool {
             type Input = AddingToolInput;
-            type Output = serde_json::Value;
             type Error = String;
 
             fn name(&self) -> &str {
                 "adding_tool"
             }
 
-            async fn invoke(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
-                Ok(json!({"result": input.a + input.b}))
+            async fn invoke(
+                &self,
+                tool_call_id: &str,
+                input: Self::Input,
+            ) -> Result<Messages, Self::Error> {
+                Ok(UserMessage::new(vec![json!({"result": input.a + input.b}).to_string()]).into())
             }
         }
 
@@ -419,7 +411,9 @@ mod test {
             .client(client)
             .build();
         let tools = ToolBox::builder().tool(AddingTool).build();
-        let mut messages = Messages::from(UserMessage::from(vec!["This is a test, use adding tool to verify if everything is working."]));
+        let mut messages = Messages::from(UserMessage::from(vec![
+            "This is a test, use adding tool to verify if everything is working.",
+        ]));
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
@@ -432,8 +426,8 @@ mod test {
         messages.push(res.clone());
         if let Some(tool_calls) = res.tool_calls() {
             for tool_call in tool_calls {
-                let msg = tools.invoke(tool_call).await;
-                messages.push(msg);
+                let msg = tools.invoke(&tool_call).await;
+                messages.extend(msg);
             }
         }
         let res = openrouter
@@ -446,8 +440,6 @@ mod test {
             .await
             .unwrap();
         dbg!(&res);
-
-
     }
 
     #[tokio::test]
@@ -463,14 +455,17 @@ mod test {
         #[async_trait::async_trait]
         impl Tool for Wikipedia {
             type Input = WikipediaInput;
-            type Output = serde_json::Value;
             type Error = String;
 
             fn name(&self) -> &str {
                 "wikipedia"
             }
 
-            async fn invoke(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
+            async fn invoke(
+                &self,
+                tool_call_id: &str,
+                input: Self::Input,
+            ) -> Result<Messages, Self::Error> {
                 let url = format!(
                             "https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={}",
                             input.query
@@ -481,7 +476,8 @@ mod test {
                     .json::<serde_json::Value>()
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(res)
+                let msgs = UserMessage::new(vec![res.to_string()]);
+                Ok(msgs.into())
             }
         }
 
@@ -492,7 +488,9 @@ mod test {
             .client(client)
             .build();
         let tools = ToolBox::builder().tool(Wikipedia).build();
-        let mut messages = Messages::from(UserMessage::from(vec!["Search Apollo project on Wikipedia."]));
+        let mut messages = Messages::from(UserMessage::from(vec![
+            "Search Apollo project on Wikipedia.",
+        ]));
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
@@ -505,8 +503,8 @@ mod test {
         messages.push(res.clone());
         if let Some(tool_calls) = res.tool_calls() {
             for tool_call in tool_calls {
-                let msg = tools.invoke(tool_call).await;
-                messages.push(msg);
+                let msg = tools.invoke(&tool_call).await;
+                messages.extend(msg);
             }
         }
         let res = openrouter
@@ -519,7 +517,5 @@ mod test {
             .await
             .unwrap();
         dbg!(&res);
-
-
     }
 }

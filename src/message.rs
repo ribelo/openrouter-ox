@@ -216,6 +216,17 @@ impl<S: user_message_builder::State> UserMessageBuilder<S> {
 }
 
 impl UserMessage {
+    pub fn new<T, U>(content: T) -> Self
+    where
+        T: IntoIterator<Item = U>,
+        U: Into<ContentPart>,
+    {
+        Self {
+            content: content.into_iter().map(Into::into).collect(),
+            name: None,
+        }
+    }
+
     pub fn content(&self) -> &Content {
         &self.content
     }
@@ -234,19 +245,6 @@ impl UserMessage {
 
     pub fn len(&self) -> usize {
         self.content.len()
-    }
-}
-
-impl UserMessage {
-    pub fn new<T, U>(content: T) -> Self
-    where
-        T: IntoIterator<Item = U>,
-        U: Into<ContentPart>,
-    {
-        Self {
-            content: content.into_iter().map(Into::into).collect(),
-            name: None,
-        }
     }
 }
 
@@ -275,6 +273,41 @@ pub struct AssistantMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+}
+
+impl AssistantMessage {
+    pub fn new<T, U>(content: T) -> Self
+    where
+        T: IntoIterator<Item = U>,
+        U: Into<ContentPart>,
+    {
+        Self {
+            content: content.into_iter().map(Into::into).collect(),
+            name: None,
+            tool_calls: None,
+            refusal: None,
+        }
+    }
+
+    pub fn content(&self) -> &Content {
+        &self.content
+    }
+
+    pub fn content_mut(&mut self) -> &mut Content {
+        &mut self.content
+    }
+
+    pub fn push_content(&mut self, content: impl Into<ContentPart>) {
+        self.content.push(content.into());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.content.len()
+    }
 }
 
 impl<T, U> From<T> for AssistantMessage
@@ -308,6 +341,13 @@ impl<S: tool_message_builder::State> ToolMessageBuilder<S> {
 }
 
 impl ToolMessage {
+    pub fn new(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            tool_call_id: tool_call_id.into(),
+        }
+    }
+
     fn content(&self) -> &String {
         &self.content
     }
@@ -371,6 +411,10 @@ pub struct Messages(pub Vec<Message>);
 impl Messages {
     pub fn push(&mut self, message: impl Into<Message>) {
         self.0.push(message.into());
+    }
+
+    pub fn insert(&mut self, index: usize, message: impl Into<Message>) {
+        self.0.insert(index, message.into());
     }
 }
 

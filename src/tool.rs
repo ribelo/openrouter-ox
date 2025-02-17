@@ -10,7 +10,10 @@ use schemars::{schema_for, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{message::ToolMessage, response::ToolCall};
+use crate::{
+    message::{Messages, ToolMessage},
+    response::ToolCall,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionDescription {
@@ -18,13 +21,6 @@ pub struct FunctionDescription {
     pub description: Option<String>,
     pub name: String,
     pub parameters: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSchema {
-    #[serde(rename = "type")]
-    pub tool_type: String,
-    pub function: FunctionDescription,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,10 +43,16 @@ pub struct FunctionName {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolMetadata {
+pub struct ToolSchema {
     #[serde(rename = "type")]
     pub tool_type: String,
     pub function: FunctionMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolMetadata {
+    pub name: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +70,7 @@ pub struct ToolBox {
 }
 
 impl<S: tool_box_builder::State> ToolBoxBuilder<S> {
-    pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
+    pub fn tool<T: Tool + 'static>(self, tool: T) -> Self {
         let name = tool.name().to_string();
         self.tools.write().unwrap().insert(name, Arc::new(tool));
         self
@@ -111,13 +113,21 @@ impl ToolBox {
         self.tools.read().unwrap().get(name).cloned()
     }
 
-    pub async fn invoke(&self, tool_call: ToolCall) -> ToolMessage {
+    pub async fn invoke(&self, tool_call: &ToolCall) -> Messages {
         match self.get(&tool_call.function.name) {
-            Some(tool) => tool.invoke_any(tool_call).await,
+            Some(tool) => tool.invoke_any(&tool_call).await,
             None => ToolMessage {
-                content: ToolError::ToolNotFound(tool_call.function.name).to_string(),
-                tool_call_id: tool_call.id,
-            },
+                content: ToolError::ToolNotFound(tool_call.function.name.clone()).to_string(),
+                tool_call_id: tool_call.id.clone(),
+            }
+            .into(),
+        }
+    }
+
+    pub fn return_direct(&self, tool_call: &ToolCall) -> bool {
+        match self.get(&tool_call.function.name) {
+            Some(tool) => tool.return_direct(),
+            None => false,
         }
     }
 
@@ -132,12 +142,12 @@ impl ToolBox {
     }
 
     #[must_use]
-    pub fn metadata(&self) -> Vec<ToolMetadata> {
+    pub fn metadata(&self) -> Vec<ToolSchema> {
         self.tools
             .read()
             .unwrap()
             .values()
-            .map(|tool| ToolMetadata {
+            .map(|tool| ToolSchema {
                 tool_type: "function".to_string(),
                 function: FunctionMetadata {
                     name: tool.name().to_string(),
@@ -147,6 +157,7 @@ impl ToolBox {
             })
             .collect()
     }
+
 }
 
 impl Serialize for ToolBox {
@@ -158,24 +169,28 @@ impl Serialize for ToolBox {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolsList(Vec<ToolMetadata>);
+
 #[async_trait]
 pub trait AnyTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> Option<&str>;
-    async fn invoke_any(&self, tool_call: ToolCall) -> ToolMessage;
+    async fn invoke_any(&self, tool_call: &ToolCall) -> Messages;
     fn input_schema(&self) -> Value;
+    fn return_direct(&self) -> bool;
 }
 
 #[async_trait]
-pub trait Tool: Clone + Send + Sync {
+pub trait Tool: Send + Sync {
     type Input: JsonSchema + DeserializeOwned + Debug + Send + Sync;
-    type Output: Serialize + Debug + Send + Sync;
     type Error: ToString + Debug;
     fn name(&self) -> &str;
     fn description(&self) -> Option<&str> {
         None
     }
-    async fn invoke(&self, input: Self::Input) -> Result<Self::Output, Self::Error>;
+    async fn invoke(&self, tool_call_id: &str, input: Self::Input)
+        -> Result<Messages, Self::Error>;
     fn tool_schema(&self) -> Value {
         let json_schema = schema_for!(Self::Input);
         let mut input_schema = serde_json::to_value(json_schema).unwrap();
@@ -190,7 +205,7 @@ pub trait Tool: Clone + Send + Sync {
             serde_json::json!(None::<()>)
         }
     }
-    fn direct_output(&self) -> bool {
+    fn return_direct(&self) -> bool {
         false
     }
 }
@@ -205,46 +220,44 @@ impl<T: Tool + Send + Sync> AnyTool for T {
         self.description()
     }
 
-    async fn invoke_any(&self, tool_call: ToolCall) -> ToolMessage {
+    async fn invoke_any(&self, tool_call: &ToolCall) -> Messages {
         let typed_input: T::Input = match serde_json::from_str(&tool_call.function.arguments) {
             Ok(input) => input,
             Err(e) => {
                 return ToolMessage::builder()
                     .tool_call_id(&tool_call.id)
                     .content(ToolError::InputDeserializationFailed(e.to_string()).to_string())
-                    .build();
+                    .build()
+                    .into();
             }
         };
 
-        match self.invoke(typed_input).await {
-            Ok(output) => match serde_json::to_value(output) {
-                Ok(value) => ToolMessage::builder()
-                    .tool_call_id(&tool_call.id)
-                    .content(serde_json::to_string_pretty(&value).unwrap())
-                    .build(),
-                Err(e) => ToolMessage::builder()
-                    .tool_call_id(&tool_call.id)
-                    .content(ToolError::OutputSerializationFailed(e.to_string()).to_string())
-                    .build(),
-            },
+        match self.invoke(&tool_call.id, typed_input).await {
+            Ok(messages) => messages.into(),
             Err(e) => ToolMessage::builder()
                 .tool_call_id(&tool_call.id)
                 .content(e.to_string())
-                .build(),
+                .build()
+                .into(),
         }
     }
 
     fn input_schema(&self) -> Value {
         self.tool_schema()
     }
+
+    fn return_direct(&self) -> bool {
+        self.return_direct()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::message::UserMessage;
+
     use super::*;
     use async_trait::async_trait;
     use schemars::JsonSchema;
-    use serde_json::Value;
 
     #[test]
     fn test_tool_schema() {
@@ -260,17 +273,18 @@ mod tests {
         #[async_trait]
         impl Tool for TestTool {
             type Input = TestInput;
-
-            type Output = Value;
-
             type Error = String;
 
             fn name(&self) -> &str {
                 "finish_tool"
             }
 
-            async fn invoke(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
-                todo!()
+            async fn invoke(
+                &self,
+                tool_call_id: &str,
+                input: Self::Input,
+            ) -> Result<Messages, Self::Error> {
+                Ok(UserMessage::new(vec!["finish".to_string()]).into())
             }
         }
         let schema = TestTool.input_schema();

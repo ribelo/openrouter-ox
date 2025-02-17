@@ -8,6 +8,7 @@ pub mod request;
 pub mod response;
 pub mod tool;
 pub mod agent;
+pub mod router;
 const BASE_URL: &str = "https://openrouter.ai";
 
 #[cfg(feature = "leaky-bucket")]
