@@ -9,6 +9,7 @@ pub mod response;
 pub mod tool;
 pub mod agent;
 pub mod router;
+pub mod models;
 const BASE_URL: &str = "https://openrouter.ai";
 
 #[cfg(feature = "leaky-bucket")]
@@ -19,6 +20,7 @@ use std::{collections::HashMap, fmt};
 
 #[derive(Clone, Builder)]
 pub struct OpenRouter {
+    #[builder(into)]
     api_key: String,
     #[builder(default)]
     headers: HashMap<String, String>,
