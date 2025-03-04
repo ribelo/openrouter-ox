@@ -1,6 +1,7 @@
 use std::fmt;
 
 use bon::{builder, Builder};
+use derive_more::Deref;
 use serde::{Deserialize, Serialize};
 
 use crate::response::ToolCall;
@@ -14,7 +15,7 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Builder)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Builder, Deref)]
 pub struct TextContent {
     pub text: String,
 }

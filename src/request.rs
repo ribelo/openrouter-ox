@@ -94,7 +94,6 @@ impl<S: request_builder::State> RequestBuilder<S> {
     }
     pub fn response_format<T: JsonSchema + Serialize>(mut self) -> Self {
         let type_name = std::any::type_name::<T>().split("::").last().unwrap();
-        dbg!(std::any::type_name::<T>());
         let json_schema = schema_for!(T);
         let response_format = json!({
             "type": "json_schema",
