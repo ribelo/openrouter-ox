@@ -9,6 +9,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
+    #[serde(alias = "STOP")]
     Stop,
     Limit,
     ContentFilter,

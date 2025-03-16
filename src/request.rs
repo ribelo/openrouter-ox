@@ -517,4 +517,29 @@ mod test {
             .unwrap();
         dbg!(&res);
     }
+
+    #[tokio::test]
+    async fn test_json_output() {
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+        pub struct TestOutput {
+            probability: f64,
+            explanation: String,
+        }
+
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+        let openrouter = OpenRouter::builder().api_key(api_key).build();
+        let mut messages = Messages::from(UserMessage::from(vec![
+            "Can we live forever in the future?",
+        ]));
+        let res = openrouter
+            .chat_completion()
+            .model("google/gemini-2.0-flash-001")
+            .messages(messages.clone())
+            .response_format::<TestOutput>()
+            .build()
+            .send()
+            .await
+            .unwrap();
+        dbg!(&res);
+    }
 }

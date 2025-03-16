@@ -372,6 +372,20 @@ pub enum Message {
     Tool(ToolMessage),
 }
 
+impl Message {
+    pub fn system(content: impl Into<Content>) -> Self {
+        Message::System(SystemMessage::new(content.into()))
+    }
+
+    pub fn user(content: impl Into<Content>) -> Self {
+        Message::User(UserMessage::new(content.into()))
+    }
+
+    pub fn assistant(content: impl Into<Content>) -> Self {
+        Message::Assistant(AssistantMessage::new(content.into()))
+    }
+}
+
 impl From<SystemMessage> for Message {
     fn from(message: SystemMessage) -> Self {
         Message::System(message)
