@@ -349,15 +349,15 @@ impl ToolMessage {
         }
     }
 
-    fn content(&self) -> &String {
+    pub fn content(&self) -> &String {
         &self.content
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.content.len()
     }
 }

@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
+    future::Future,
+    marker::PhantomData,
     sync::{Arc, RwLock},
 };
 
@@ -124,13 +126,6 @@ impl ToolBox {
         }
     }
 
-    pub fn return_direct(&self, tool_call: &ToolCall) -> bool {
-        match self.get(&tool_call.function.name) {
-            Some(tool) => tool.return_direct(),
-            None => false,
-        }
-    }
-
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tools.read().unwrap().is_empty()
@@ -158,6 +153,25 @@ impl ToolBox {
             .collect()
     }
 
+    pub fn filter_tools(&self) -> Vec<Arc<dyn AnyTool>> {
+        self.tools
+            .read()
+            .unwrap()
+            .values()
+            .filter(|tool| !tool.is_subagent())
+            .cloned()
+            .collect()
+    }
+
+    pub fn filter_agents(&self) -> Vec<Arc<dyn AnyTool>> {
+        self.tools
+            .read()
+            .unwrap()
+            .values()
+            .filter(|tool| tool.is_subagent())
+            .cloned()
+            .collect()
+    }
 }
 
 impl Serialize for ToolBox {
@@ -178,13 +192,13 @@ pub trait AnyTool: Send + Sync {
     fn description(&self) -> Option<&str>;
     async fn invoke_any(&self, tool_call: &ToolCall) -> Messages;
     fn input_schema(&self) -> Value;
-    fn return_direct(&self) -> bool;
+    fn is_subagent(&self) -> bool;
 }
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    type Input: JsonSchema + DeserializeOwned + Debug + Send + Sync;
-    type Error: ToString + Debug;
+    type Input: JsonSchema + DeserializeOwned + Send + Sync;
+    type Error: ToString;
     fn name(&self) -> &str;
     fn description(&self) -> Option<&str> {
         None
@@ -205,7 +219,7 @@ pub trait Tool: Send + Sync {
             serde_json::json!(None::<()>)
         }
     }
-    fn return_direct(&self) -> bool {
+    fn is_subagent(&self) -> bool {
         false
     }
 }
@@ -246,8 +260,79 @@ impl<T: Tool + Send + Sync> AnyTool for T {
         self.tool_schema()
     }
 
-    fn return_direct(&self) -> bool {
-        self.return_direct()
+    fn is_subagent(&self) -> bool {
+        self.is_subagent()
+    }
+}
+
+#[derive(Clone, Builder)]
+pub struct SimpleTool<I, O, E, Fut>
+where
+    I: JsonSchema + Serialize + DeserializeOwned,
+    O: Serialize,
+    E: ToString,
+    Fut: Future<Output = Result<O, E>> + Send + 'static,
+{
+    #[builder(into)]
+    name: String,
+    #[builder(into)]
+    description: Option<String>,
+    handler: fn(I) -> Fut,
+}
+
+// impl<I, O, E, Fut, S: simple_tool_builder::State> SimpleToolBuilder<I, O, E, Fut, S>
+// where
+//     I: JsonSchema + Serialize + DeserializeOwned,
+//     O: Serialize,
+//     E: ToString,
+//     Fut: Future<Output = Result<O, E>> + Send + 'static,
+// {
+//     pub fn handler<F>(mut self, handler: F) -> Self
+//     where
+//         F: Fn(I) -> Fut + Send + Sync + 'static,
+//     {
+//         self.handler = Arc::new(handler);
+//         self
+//     }
+// }
+
+#[async_trait]
+impl<I, O, E, Fut> Tool for SimpleTool<I, O, E, Fut>
+where
+    I: JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
+    O: Serialize,
+    E: ToString,
+    Fut: Future<Output = Result<O, E>> + Send + 'static,
+{
+    type Input = I;
+    type Error = String;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    async fn invoke(
+        &self,
+        tool_call_id: &str,
+        input: Self::Input,
+    ) -> Result<Messages, Self::Error> {
+        match (self.handler)(input).await {
+            Ok(content) => {
+                let serialized = serde_json::to_string(&content)
+                    .map_err(|e| format!("Failed to serialize output: {}", e))?;
+
+                Ok(ToolMessage::builder()
+                    .tool_call_id(tool_call_id)
+                    .content(serialized)
+                    .build()
+                    .into())
+            }
+            Err(err) => Err(err.to_string()),
+        }
     }
 }
 

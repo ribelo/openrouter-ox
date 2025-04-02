@@ -1,8 +1,8 @@
 use bon::Builder;
-use schemars::{schema_for, JsonSchema};
-use serde::{Deserialize, Serialize};
+use schemars::{generate::SchemaSettings, schema_for, JsonSchema};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     message::{Message, Messages},
@@ -92,9 +92,12 @@ impl<S: request_builder::State> RequestBuilder<S> {
         self.messages.push(message.into());
         self
     }
-    pub fn response_format<T: JsonSchema + Serialize>(mut self) -> Self {
+    pub fn response_format<T: JsonSchema + Serialize + DeserializeOwned>(mut self) -> Self {
         let type_name = std::any::type_name::<T>().split("::").last().unwrap();
-        let json_schema = schema_for!(T);
+        let mut schema_settings = SchemaSettings::draft2020_12();
+        schema_settings.inline_subschemas = true;
+        let schema_generator = schema_settings.into_generator();
+        let json_schema = schema_generator.into_root_schema_for::<T>();
         let response_format = json!({
             "type": "json_schema",
             "json_schema": {"name": type_name, "schema": json_schema},
@@ -109,8 +112,10 @@ impl Request {
         self.messages.push(message.into());
     }
     pub async fn send(&self) -> Result<ChatCompletionResponse, ApiRequestError> {
-        let body = serde_json::to_value(self).unwrap();
-        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&self).unwrap()
+        );
         let url = format!("{}/{}", BASE_URL, API_URL);
         let req = self
             .open_router
@@ -125,7 +130,6 @@ impl Request {
         let res = req.send().await.unwrap();
         if res.status().is_success() {
             let text = res.text().await.unwrap();
-            dbg!(&text);
             let data: crate::response::ChatCompletionResponse =
                 serde_json::from_str(&text).unwrap();
             Ok(data)
@@ -138,7 +142,6 @@ impl Request {
     pub async fn stream(
         &self,
     ) -> impl tokio_stream::Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> {
-        use tokio_stream::StreamExt;
         let url = format!("{}/{}", BASE_URL, API_URL);
         let mut body = serde_json::to_value(self).unwrap();
         body["stream"] = serde_json::Value::Bool(true);
@@ -170,23 +173,6 @@ impl Request {
     }
 }
 
-// impl TokenCount for Message {
-//     fn token_count(&self) -> usize {
-//         match self {
-//             Message::System(message) => message.content.token_count(),
-//             Message::User(message) => message.content.token_count(),
-//             Message::Assistant(message) => message.content.token_count(),
-//             Message::Tool(message) => message.content.token_count(),
-//         }
-//     }
-// }
-
-// impl TokenCount for Messages {
-//     fn token_count(&self) -> usize {
-//         self.0.iter().map(|m| m.token_count()).sum()
-//     }
-// }
-
 impl OpenRouter {
     pub fn chat_completion(&self) -> RequestBuilder<request_builder::SetOpenRouter> {
         Request::builder().open_router(self.clone())
@@ -198,12 +184,12 @@ mod test {
 
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio_stream::StreamExt;
 
     use crate::{
-        message::{Messages, UserMessage},
-        tool::{Tool, ToolBox},
+        message::{Messages, ToolMessage, UserMessage},
+        tool::{SimpleTool, Tool, ToolBox},
         OpenRouter,
     };
 
@@ -220,7 +206,6 @@ mod test {
                 "content": "Hello!"
             }]
         });
-        dbg!(&payload);
 
         let response = client
             .post("https://openrouter.ai/api/v1/chat/completions")
@@ -274,7 +259,7 @@ mod test {
 
     #[tokio::test]
     async fn test_response_format() {
-        #[derive(Debug, Clone, Serialize, JsonSchema)]
+        #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
         struct MyResult {
             expresion: String,
             result: String,
@@ -376,46 +361,32 @@ mod test {
 
     #[tokio::test]
     async fn test_adding_tool() {
-        #[derive(Debug, Clone)]
-        pub struct AddingTool;
-
-        #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
         pub struct AddingToolInput {
             a: f32,
             b: f32,
         }
-
-        #[async_trait::async_trait]
-        impl Tool for AddingTool {
-            type Input = AddingToolInput;
-            type Error = String;
-
-            fn name(&self) -> &str {
-                "adding_tool"
-            }
-
-            async fn invoke(
-                &self,
-                tool_call_id: &str,
-                input: Self::Input,
-            ) -> Result<Messages, Self::Error> {
-                Ok(UserMessage::new(vec![json!({"result": input.a + input.b}).to_string()]).into())
-            }
-        }
-
-        let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+        let adding_tool = SimpleTool::builder()
+            .name("adding_tool")
+            .handler(|input: AddingToolInput| async move {
+                let result = input.a + input.b;
+                Ok::<_, String>(serde_json::json!({ "result": result }))
+            })
+            .build();
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
         let client = reqwest::Client::new();
         let openrouter = OpenRouter::builder()
             .api_key(api_key)
             .client(client)
             .build();
-        let tools = ToolBox::builder().tool(AddingTool).build();
+        let tools = ToolBox::builder().tool(adding_tool).build();
         let mut messages = Messages::from(UserMessage::from(vec![
-            "This is a test, use adding tool to verify if everything is working.",
+            "This is a test, use adding tool with any value to verify if everything is working.",
         ]));
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
+            // .model("anthropic/claude-3.7-sonnet:beta")
             .tools(tools.clone())
             .messages(messages.clone())
             .build()
@@ -429,9 +400,11 @@ mod test {
                 messages.extend(msg);
             }
         }
+        dbg!(&messages);
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
+            // .model("anthropic/claude-3.7-sonnet:beta")
             .tools(tools.clone())
             .messages(messages)
             .build()
