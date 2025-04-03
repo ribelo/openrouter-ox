@@ -6,7 +6,7 @@ use crate::{
     ApiRequestError, ErrorResponse,
 };
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     #[serde(alias = "STOP")]
@@ -147,7 +147,7 @@ impl<'de> Deserialize<'de> for Choice {
 #[serde(rename_all = "snake_case")]
 pub struct ToolCall {
     pub index: Option<usize>,
-    pub id: String,
+    pub id: Option<String>,
     #[serde(rename = "type")]
     pub type_field: String,
     pub function: FunctionCall,
@@ -156,7 +156,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FunctionCall {
-    pub name: String,
+    pub name: Option<String>,
     pub arguments: String,
 }
 
@@ -225,30 +225,70 @@ pub struct ChatCompletionChunk {
 }
 
 impl ChatCompletionChunk {
-    pub fn from_streaming_line(line: &str) -> Option<Result<ChatCompletionChunk, ApiRequestError>> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if let Ok(err) = serde_json::from_str::<ErrorResponse>(trimmed) {
-            return Some(Err(ApiRequestError::InvalidRequestError(err)));
-        }
-        if !trimmed.starts_with("data:") {
-            return None;
-        }
-        let data = trimmed.strip_prefix("data:")?.trim();
-        if data == "[DONE]" {
-            return None;
-        }
-        match serde_json::from_str::<ChatCompletionChunk>(data) {
-            Ok(chunk) => Some(Ok(chunk)),
-            Err(_) => match serde_json::from_str::<ErrorResponse>(data) {
-                Ok(error_response) => {
-                    Some(Err(ApiRequestError::InvalidRequestError(error_response)))
+    pub fn from_streaming_data(
+        lines_str: &str,
+    ) -> Vec<Result<ChatCompletionChunk, ApiRequestError>> {
+        let mut results = Vec::new();
+        for line in lines_str.lines() {
+            // The original debug prints are removed for cleaner code.
+            // If needed, they could be added back, potentially using a logging framework.
+            // println!("lines {}", line.lines().count()); // This would always be 1 here.
+            // println!("Processing line: {}", line);
+            // println!();
+            // println!();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue; // Skip empty lines
+            }
+
+            // Some providers might send error JSON directly without the 'data:' prefix
+            if let Ok(err) = serde_json::from_str::<ErrorResponse>(trimmed) {
+                results.push(Err(ApiRequestError::InvalidRequestError(err)));
+                continue;
+            }
+
+            if !trimmed.starts_with("data:") {
+                // Ignore lines not starting with 'data:' unless it was parsed as an error above
+                continue;
+            }
+
+            let data = match trimmed.strip_prefix("data:") {
+                Some(d) => d.trim(),
+                // This case should technically be unreachable due to the starts_with check,
+                // but we handle it defensively by skipping the line.
+                None => continue,
+            };
+
+            if data == "[DONE]" {
+                // The [DONE] marker signifies the end of the stream.
+                // It doesn't contain chunk data, so we skip it.
+                continue;
+            }
+
+            // Attempt to parse the data payload as a ChatCompletionChunk
+            match serde_json::from_str::<ChatCompletionChunk>(data) {
+                Ok(chunk) => results.push(Ok(chunk)),
+                Err(_e) => {
+                    // Use _e to indicate the variable is intentionally unused
+                    // If parsing as a chunk fails, try parsing as an ErrorResponse,
+                    // as some APIs might send errors within the 'data:' payload.
+                    match serde_json::from_str::<ErrorResponse>(data) {
+                        Ok(error_response) => {
+                            results.push(Err(ApiRequestError::InvalidRequestError(error_response)));
+                        }
+                        Err(_) => {
+                            // If it fails to parse as both ChatCompletionChunk and ErrorResponse,
+                            // the line is considered unparseable in the expected formats.
+                            // We skip it, mirroring the behavior of the original function.
+                            // Consider adding logging here if unparseable lines need tracking.
+                            // eprintln!("Failed to parse stream data line: {}", data);
+                            // eprintln!("Chunk Error: {:?}, ErrorResponse Error: {:?}", _e, _);
+                        }
+                    }
                 }
-                Err(_) => None,
-            },
+            }
         }
+        results
     }
 }
 

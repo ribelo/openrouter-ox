@@ -116,13 +116,26 @@ impl ToolBox {
     }
 
     pub async fn invoke(&self, tool_call: &ToolCall) -> Messages {
-        match self.get(&tool_call.function.name) {
-            Some(tool) => tool.invoke_any(&tool_call).await,
-            None => ToolMessage {
-                content: ToolError::ToolNotFound(tool_call.function.name.clone()).to_string(),
-                tool_call_id: tool_call.id.clone(),
+        // Assuming name and id always exist as per the prompt.
+        // Use as_deref() to borrow the content of the Option<String> as &str without moving.
+        let tool_name = tool_call
+            .function
+            .name
+            .as_deref()
+            .expect("Tool function name is missing");
+        let tool_call_id = tool_call.id.as_deref().expect("Tool call ID is missing");
+
+        match self.get(tool_name) {
+            Some(tool) => tool.invoke_any(tool_call).await,
+            None => {
+                // Use the borrowed tool_name and clone it to create the error message.
+                // Use the borrowed tool_call_id and convert it to String for ToolMessage.
+                ToolMessage {
+                    content: ToolError::ToolNotFound(tool_name.to_string()).to_string(),
+                    tool_call_id: tool_call_id.to_string(),
+                }
+                .into()
             }
-            .into(),
         }
     }
 
@@ -235,24 +248,43 @@ impl<T: Tool + Send + Sync> AnyTool for T {
     }
 
     async fn invoke_any(&self, tool_call: &ToolCall) -> Messages {
+        // Assumption: tool_call.id and tool_call.function.name are always Some.
+        // Use expect() to enforce this assumption at runtime. Panics if violated.
+        let tool_call_id_str = tool_call
+            .id
+            .as_deref()
+            .expect("Tool call ID is missing, but was expected.");
+        // let _tool_name = tool_call
+        //     .function
+        //     .name
+        //     .as_deref()
+        //     .expect("Tool function name is missing, but was expected."); // Name used implicitly by caller (ToolBox::invoke)
+
         let typed_input: T::Input = match serde_json::from_str(&tool_call.function.arguments) {
             Ok(input) => input,
             Err(e) => {
+                // Deserialization failed, return ToolMessage with the correct (expected) ID
                 return ToolMessage::builder()
-                    .tool_call_id(&tool_call.id)
+                    // Pass the ID as String
+                    .tool_call_id(tool_call_id_str.to_string())
                     .content(ToolError::InputDeserializationFailed(e.to_string()).to_string())
                     .build()
                     .into();
             }
         };
 
-        match self.invoke(&tool_call.id, typed_input).await {
-            Ok(messages) => messages.into(),
-            Err(e) => ToolMessage::builder()
-                .tool_call_id(&tool_call.id)
-                .content(e.to_string())
-                .build()
-                .into(),
+        // Invoke the actual tool implementation with &str tool_call_id
+        match self.invoke(tool_call_id_str, typed_input).await {
+            Ok(messages) => messages, // Success, return the result messages
+            Err(e) => {
+                // Invocation failed, return ToolMessage with the correct (expected) ID
+                ToolMessage::builder()
+                    // Pass the ID as String
+                    .tool_call_id(tool_call_id_str.to_string())
+                    .content(e.to_string()) // Use the error from the tool
+                    .build()
+                    .into()
+            }
         }
     }
 

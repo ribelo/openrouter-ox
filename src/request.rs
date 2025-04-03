@@ -1,7 +1,9 @@
+use async_stream::{stream, try_stream};
 use bon::Builder;
 use schemars::{generate::SchemaSettings, schema_for, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::{fs::try_exists, sync::mpsc};
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
@@ -112,10 +114,6 @@ impl Request {
         self.messages.push(message.into());
     }
     pub async fn send(&self) -> Result<ChatCompletionResponse, ApiRequestError> {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&self).unwrap()
-        );
         let url = format!("{}/{}", BASE_URL, API_URL);
         let req = self
             .open_router
@@ -141,36 +139,95 @@ impl Request {
 
     pub async fn stream(
         &self,
-    ) -> impl Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> {
+    ) -> impl Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> + Send + 'static {
+        // Clone necessary owned data from `self` to ensure the stream closure
+        // satisfies Send + 'static bounds.
+        let client = self.open_router.client.clone();
+        let api_key = self.open_router.api_key.clone();
         let url = format!("{}/{}", BASE_URL, API_URL);
-        let mut body = serde_json::to_value(self).unwrap();
-        body["stream"] = serde_json::Value::Bool(true);
 
-        let response = self
-            .open_router
-            .client
-            .post(&url)
-            .bearer_auth(&self.open_router.api_key)
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        let byte_stream = response.bytes_stream();
+        // Clone the serializable parts of the request.
+        // We need to clone because the stream closure requires 'static lifetime.
+        // Alternatively, one could structure the Request struct differently.
+        let request_data = self.clone(); // Assuming Request implements Clone
 
-        let parsed_stream = byte_stream.filter_map(move |chunk_result| {
-            let chunk = match chunk_result {
-                Ok(bytes) => bytes,
-                Err(e) => return Some(Err(ApiRequestError::Stream(e.to_string()))),
+        // Use try_stream! macro for cleaner async stream generation and error handling.
+        let output_stream = try_stream! {
+            // Serialize the request body *inside* the stream block.
+            // This allows propagating serialization errors via the stream itself.
+            let request_body = {
+                let mut body = serde_json::to_value(&request_data)?;
+                // Ensure the 'stream' field is set to true for streaming requests.
+                // The `body` is known to be an Object here due to how Request is structured.
+                let obj = body.as_object_mut().expect("Request body must be a JSON object");
+                obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+                body
             };
-            let chunk_str = match String::from_utf8(chunk.to_vec()) {
-                Ok(s) => s,
-                Err(e) => return Some(Err(ApiRequestError::Stream(e.to_string()))),
-            };
-            dbg!(&chunk_str);
-            ChatCompletionChunk::from_streaming_line(&chunk_str)
-        });
 
-        Box::pin(parsed_stream)
+            // Send the request asynchronously.
+            let response = client
+                .post(&url)
+                .bearer_auth(&api_key) // Use the cloned api_key
+                .json(&request_body)   // Use the prepared request_body
+                .send()
+                .await
+                .map_err(ApiRequestError::ReqwestError)?; // Propagate reqwest errors
+
+            // Check if the initial HTTP response indicates failure.
+            if !response.status().is_success() {
+                let status = response.status();
+                // Attempt to read the error body. .json() consumes the response body.
+                // If parsing fails, we still want to report the status code and raw text if possible.
+                let error_response_result: Result<ErrorResponse, reqwest::Error> = response.json().await;
+
+                match error_response_result {
+                    Ok(error_response) => {
+                        // Successfully parsed the structured error.
+                        // Use `Err(...)?` to yield the error and terminate the stream.
+                        Err(ApiRequestError::InvalidRequestError(error_response))?;
+                    }
+                    Err(json_err) => {
+                        // Failed to parse as ErrorResponse. Yield a more informative error.
+                        // We don't have the raw text anymore because .json() consumed it.
+                        // We report the original status and the JSON parsing error.
+                        Err(ApiRequestError::Stream(format!(
+                            "API error (status {}): Failed to parse error response JSON: {}",
+                            status, json_err
+                        )))?;
+                    }
+                }
+                // Note: The stream terminates here if Err(...)? was executed.
+            } else {
+                // HTTP response indicates success, proceed to stream the body.
+                // Getting the byte stream consumes the response body.
+                let mut byte_stream = response.bytes_stream();
+
+                // Process the stream of byte chunks.
+                while let Some(chunk_result) = byte_stream.next().await {
+                    // Handle potential errors during chunk retrieval (e.g., network issues).
+                    let chunk = chunk_result?;
+
+                    // Attempt to decode the byte chunk as UTF-8.
+                    let chunk_str = String::from_utf8(chunk.to_vec())
+                        .map_err(|e| ApiRequestError::Stream(format!("UTF-8 decode error: {}", e)))?;
+
+                    // A single chunk might contain multiple Server-Sent Events (SSE).
+                    // Parse the string chunk, which might yield multiple ChatCompletionChunks.
+                    // ChatCompletionChunk::from_streaming_data should handle parsing logic and potential errors within the SSE data.
+                    // It should return a Result compatible with ApiRequestError.
+                    for parse_result in ChatCompletionChunk::from_streaming_data(&chunk_str) {
+                        // Use `yield value?` syntax:
+                        // If parse_result is Ok(chunk), yield the chunk via the stream.
+                        // If parse_result is Err(e), propagate the parsing error (which terminates the stream).
+                        yield parse_result?;
+                    }
+                }
+            }
+        }; // The try_stream! macro returns the Stream implementation.
+
+        // Box::pin is necessary because the return type is `impl Stream`,
+        // and async functions/blocks generate anonymous types.
+        Box::pin(output_stream)
     }
 }
 
@@ -444,8 +501,8 @@ mod test {
         // ]));
         let mut stream = openrouter
             .chat_completion()
-            .model("google/gemini-2.0-flash-001")
-            // .model("anthropic/claude-3.7-sonnet:beta")
+            // .model("google/gemini-2.0-flash-001")
+            .model("openai/gpt-4o-mini")
             .tools(tools.clone())
             .messages(messages.clone())
             .build()

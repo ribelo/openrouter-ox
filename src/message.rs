@@ -384,6 +384,29 @@ impl Message {
     pub fn assistant(content: impl Into<Content>) -> Self {
         Message::Assistant(AssistantMessage::new(content.into()))
     }
+    
+    pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
+        let assistant_msg = match content {
+            Some(content_text) if !content_text.is_empty() => {
+                AssistantMessage {
+                    content: Content::from(content_text),
+                    name: None,
+                    tool_calls,
+                    refusal: None,
+                }
+            },
+            _ => {
+                AssistantMessage {
+                    content: Content(Vec::new()),
+                    name: None,
+                    tool_calls,
+                    refusal: None,
+                }
+            }
+        };
+        
+        Message::Assistant(assistant_msg)
+    }
 }
 
 impl From<SystemMessage> for Message {

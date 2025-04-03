@@ -1,19 +1,221 @@
-use std::{marker::PhantomData, pin::Pin};
+use std::{collections::HashMap, marker::PhantomData, pin::Pin};
 
+use async_stream::try_stream;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::task::JoinSet;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
-    message::{Message, Messages, SystemMessage},
-    response::ChatCompletionResponse,
+    message::{Message, Messages, SystemMessage, ToolMessage},
+    response::{ChatCompletionChunk, ChatCompletionResponse, FinishReason, ToolCall, Usage},
     tool::{Tool, ToolBox},
     ApiRequestError, OpenRouter,
 };
+
+/// Helper struct to accumulate fragmented tool calls across multiple chunks.
+#[derive(Debug, Clone, Default)]
+struct PartialToolCall {
+    index: Option<usize>,
+    id: Option<String>,
+    type_field: String,
+    function_name: String,
+    arguments_buffer: String,
+}
+
+impl PartialToolCall {
+    /// Merges information from a tool call delta into this partial tool call.
+    /// We only care about index and merging arguments.
+    /// Assumes id, type, name are set initially by the aggregator.
+    fn merge(&mut self, delta_tool_call: &ToolCall) {
+        // Ensure index is set if it wasn't (e.g., if first delta somehow missed it)
+        // Primarily relies on aggregator setting it initially.
+        if self.index.is_none() {
+            self.index = delta_tool_call.index;
+        }
+
+        if self.id.is_none() {
+            self.id = delta_tool_call.id.clone();
+        }
+
+        if self.type_field.is_empty() && !delta_tool_call.type_field.is_empty() {
+            self.type_field = delta_tool_call.type_field.clone();
+        }
+
+        if let Some(ref name) = delta_tool_call.function.name {
+            if !name.is_empty() {
+                self.function_name = name.clone();
+            }
+        }
+
+        // Append argument chunks
+        if !delta_tool_call.function.arguments.is_empty() {
+            self.arguments_buffer
+                .push_str(&delta_tool_call.function.arguments);
+        }
+    }
+
+    /// Attempts to convert the accumulated partial data into a final ToolCall.
+    /// Returns None if essential information (like id, name) is missing.
+    fn finalize(self) -> Option<ToolCall> {
+        // Essential fields must be present
+        let id = self.id?;
+        let function_name = self.function_name; // This unwraps Option<String> to String
+
+        // Type defaults to "function" if not specified but name is present
+        let type_field = self.type_field;
+
+        Some(ToolCall {
+            index: self.index,
+            id: Some(id), // id is String here
+            type_field,
+            function: crate::response::FunctionCall {
+                name: Some(function_name),
+                arguments: self.arguments_buffer,
+            },
+        })
+    }
+}
+
+/// Manages a collection of partial tool calls during streaming
+#[derive(Debug, Default)]
+struct PartialToolCallsAggregator {
+    // Key: index of the tool call
+    // Value: The accumulator for that specific tool call
+    calls: HashMap<usize, PartialToolCall>,
+}
+
+impl PartialToolCallsAggregator {
+    /// Creates a new, empty accumulator
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a tool call delta fragment to the appropriate accumulator
+    /// Creates a new accumulator if the index hasn't been seen before
+    fn add_delta(&mut self, delta_call: &ToolCall) {
+        // Use index as the key, defaulting to 0 if missing
+        let index = delta_call.index.unwrap_or(0);
+
+        self.calls
+            .entry(index)
+            .or_default() // Get existing PartialToolCall or create a default one
+            .merge(delta_call); // Merge the delta data
+    }
+
+    /// Consumes the accumulator and returns a finalized list of ToolCalls
+    /// Incomplete calls are filtered out with warnings
+    /// The list is sorted by the original index
+    fn finalize(self) -> Vec<ToolCall> {
+        let mut finalized: Vec<ToolCall> = self
+            .calls
+            .into_values() // Consume the map and take ownership of PartialToolCalls
+            .filter_map(|partial| {
+                // Attempt to finalize each partial call
+                match partial.finalize() {
+                    Some(call) => Some(call),
+                    None => {
+                        eprintln!(
+                            "Warning: Ignoring incomplete tool call data during finalization."
+                        );
+                        None // Filter out incomplete calls
+                    }
+                }
+            })
+            .collect();
+
+        // Sort by index for deterministic order
+        finalized.sort_by_key(|call| call.index.unwrap_or(0));
+
+        finalized
+    }
+
+    /// Checks if any partial tool calls have been accumulated
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+/// Event variants emitted during agent execution
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// Emitted once at the beginning of the agent's execution
+    AgentStart,
+
+    /// A chunk of text generated by the language model
+    TextChunk { delta: String },
+
+    /// The language model has requested a tool call.
+    /// This is emitted after the model's response stream finishes for that turn
+    /// and the full tool call details are assembled.
+    ToolCallRequested { tool_call: ToolCall },
+
+    /// The result of a tool execution. Contains the content returned by the tool.
+    /// This is emitted after the agent successfully invokes the tool.
+    ToolResult { message: ToolMessage },
+
+    /// Emitted when the final LLM turn finishes, includes usage stats if available
+    StreamEnd { usage: Option<Usage> },
+
+    /// Emitted once when the agent successfully completes its task
+    AgentFinish,
+
+    /// Emitted when an error occurs during agent execution. The stream terminates after this.
+    AgentError { error: AgentErrorSerializable },
+}
+
+/// A serializable representation of AgentError for the stream.
+/// Needed because the original AgentError might contain non-serializable types.
+#[derive(Debug, Clone, Serialize, Error)]
+pub enum AgentErrorSerializable {
+    #[error("API request failed: {0}")]
+    ApiError(String),
+
+    #[error("Failed to parse JSON response: {0}")]
+    JsonParsingError(String),
+
+    #[error("Model response missing or has unexpected format: {0}")]
+    ResponseParsingError(String),
+
+    #[error("Agent reached maximum iterations ({limit}) without completing task")]
+    MaxIterationsReached { limit: usize },
+
+    #[error("Tool execution failed: {0}")]
+    ToolError(String),
+
+    #[error("Internal Agent Error: {0}")]
+    InternalError(String),
+}
+
+impl From<&AgentError> for AgentErrorSerializable {
+    fn from(error: &AgentError) -> Self {
+        match error {
+            AgentError::ApiError(e) => AgentErrorSerializable::ApiError(e.to_string()),
+            AgentError::JsonParsingError(e) => {
+                AgentErrorSerializable::JsonParsingError(e.to_string())
+            }
+            AgentError::ResponseParsingError(s) => {
+                AgentErrorSerializable::ResponseParsingError(s.clone())
+            }
+            AgentError::MaxIterationsReached { limit } => {
+                AgentErrorSerializable::MaxIterationsReached { limit: *limit }
+            }
+            AgentError::ToolError(e) => AgentErrorSerializable::ToolError(e.to_string()),
+            AgentError::InternalError(e) => AgentErrorSerializable::InternalError(e.to_string()),
+        }
+    }
+}
+
+impl From<AgentError> for AgentErrorSerializable {
+    fn from(error: AgentError) -> Self {
+        AgentErrorSerializable::from(&error)
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AgentError {
@@ -28,6 +230,12 @@ pub enum AgentError {
 
     #[error("Agent reached maximum iterations ({limit}) without completing task")]
     MaxIterationsReached { limit: usize },
+
+    #[error("Tool execution failed: {0}")]
+    ToolError(#[from] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Internal Agent Error: {0}")]
+    InternalError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -155,88 +363,147 @@ pub trait Agent: BaseAgent {
         })
     }
 
-    /// Runs the agent, potentially multiple times if tools are involved,
-    /// streaming the final response chunks or returning an error.
+    /// Runs the agent, streaming events like text chunks, tool calls, and results.
     ///
-    /// This method handles tool interactions like `run`, but streams the
-    /// final assistant message chunk by chunk. If tool calls occur, they are
-    /// processed internally, and the next LLM call is made. Only the *final*
-    /// response (after all tool calls are handled) is streamed back.
+    /// This method provides a detailed view into the agent's execution lifecycle.
+    /// It streams AgentEvent variants as they occur, including:
+    /// - AgentStart: When the agent begins execution
+    /// - TextChunk: Individual text chunks from the model
+    /// - ToolCallRequested: When the model requests a tool call
+    /// - ToolResult: When a tool returns a result
+    /// - StreamEnd: When a model turn completes
+    /// - AgentFinish: When the agent successfully completes its task
+    /// - AgentError: When an error occurs during execution
     ///
-    /// Returns a pinned, boxed stream of `Result<ChatCompletionChunk, AgentError>`.
-    /// The stream will yield `AgentError` if an API error occurs during intermediate
-    /// steps or if the maximum number of iterations is reached before a final
-    /// response is generated. The stream's lifetime is tied to the agent instance.
-    async fn run_stream<'a>(
+    /// Returns a pinned, boxed stream of `Result<AgentEvent, AgentError>`.
+    /// The stream yields events until the agent finishes or an error occurs.
+    async fn run_events<'a>(
         &'a self,
         messages: impl Into<Messages> + Send,
-    ) -> Pin<
-        Box<
-            dyn Stream<Item = Result<crate::response::ChatCompletionChunk, AgentError>> + Send + 'a,
-        >,
-    > {
-        // Prepare initial messages including system instructions
+    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'a>> {
         let mut agent_messages = Messages::default();
         if let Some(instructions) = self.instructions() {
             agent_messages.push(SystemMessage::from(vec![instructions]));
         }
-        // Note: `messages.into()` consumes the input. Ensure it's handled correctly regarding lifetimes/ownership.
-        // If `messages` needs to be used after this call, the caller should clone it first.
         agent_messages.extend(messages.into());
 
         let max_iter = self.max_iterations();
 
-        // Note: Requires the `async-stream` crate.
-        Box::pin(async_stream::try_stream! {
+        Box::pin(try_stream! {
+            yield AgentEvent::AgentStart;
 
             let mut current_messages = agent_messages;
-            let mut final_stream_completed = false;
+            let mut iteration = 0;
 
-            for iteration in 0..max_iter {
-                // Use `once` internally to get a full response and check for tool calls
-                // before deciding whether to stream the final answer or loop for tool execution.
-                let resp = self.once(current_messages.clone()).await?; // Propagates AgentError if API call fails
-                let assistant_message = Message::from(resp.clone());
-                current_messages.push(assistant_message);
+            loop {
+                if iteration >= max_iter {
+                    // Use the serializable error for yielding event
+                    let serializable_error = AgentErrorSerializable::from(&AgentError::MaxIterationsReached { limit: max_iter });
+                    yield AgentEvent::AgentError { error: serializable_error };
+                    // Propagate the original error to stop the stream correctly via try_stream!
+                    Err(AgentError::MaxIterationsReached { limit: max_iter })?;
+                }
+                iteration += 1;
 
-                // Check if the response contains tool calls and if the agent has tools defined
-                if let (Some(tools), Some(tool_calls)) = (self.tools(), resp.tool_calls()) {
-                    // If there are tool calls, invoke them and add results back to the message history
-                    // TODO: Consider parallelizing tool calls if independent.
-                    for tool_call in tool_calls {
-                        // Assuming tools.invoke handles potential errors internally or returns them encapsulated in Messages
-                        // If invoke itself can fail critically, error handling might be needed here.
-                        let tool_result_msgs = tools.invoke(&tool_call).await;
-                        current_messages.extend(tool_result_msgs);
-                    }
-                    // Continue to the next iteration to get the model's response after processing tool results
-                } else {
-                    // No tool calls in this response (or agent has no tools).
-                    // The model intends this to be the final answer.
-                    // Now, stream this final answer using the accumulated context.
-                    // This requires a second call to the API, this time in streaming mode.
-                    // This is less efficient but necessary if tool calls aren't reliably streamed
-                    // or if intermediate non-streaming calls are required for complex logic.
-                    let mut final_stream = self.stream_once(current_messages.clone()).await;
+                // --- LLM Interaction ---
+                let mut api_stream = self.stream_once(current_messages.clone()).await;
 
+                let mut accumulated_content = String::new();
+                let mut partial_tool_calls = PartialToolCallsAggregator::new();
+                let mut final_chunk_usage: Option<Usage> = None;
+                let mut finish_reason = None;
 
-                    while let Some(chunk_result) = final_stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => yield chunk, // Yield the successful chunk
-                            Err(api_err) => Err(AgentError::from(api_err))?, // Map ApiRequestError to AgentError and yield/propagate error
+                while let Some(chunk_result) = api_stream.next().await {
+                    let chunk = chunk_result?; // Propagate API errors
+                    // println!("\n\nChunk: \n{:?}\n", chunk);
+
+                    // Process choices in the chunk (usually just one)
+                    for choice in &chunk.choices {
+                        if let Some(ref delta_content) = choice.delta.content {
+                            if !delta_content.is_empty() {
+                                accumulated_content.push_str(delta_content);
+                                yield AgentEvent::TextChunk { delta: delta_content.clone() };
+                            }
+                        }
+                        if let Some(ref delta_tool_calls) = choice.delta.tool_calls {
+                            for delta_call in delta_tool_calls {
+                                // Add the delta to our tool calls manager
+                                partial_tool_calls.add_delta(delta_call);
+                            }
+                        }
+                        if let Some(ref reason) = choice.finish_reason {
+                            finish_reason = Some(reason.clone());
                         }
                     }
-                    final_stream_completed = true;
-                    // Successfully streamed the final response, break the loop.
-                    break;
+                    final_chunk_usage = chunk.usage.clone(); // Capture usage from the last chunk
                 }
-            } // End of iteration loop
 
-            // Check if the loop finished because max_iterations was reached without generating and streaming a final response.
-            if !final_stream_completed {
-                Err(AgentError::MaxIterationsReached { limit: max_iter })?;
+                yield AgentEvent::StreamEnd { usage: final_chunk_usage };
+
+                // --- Finalize Tool Calls for this turn ---
+                let finalized_tool_calls = if finish_reason == Some(FinishReason::ToolCalls) || !partial_tool_calls.is_empty() {
+                    // Convert partial calls into final ToolCall objects
+                    partial_tool_calls.finalize()
+                } else {
+                    Vec::new()
+                };
+
+                // --- Process Accumulated Response ---
+                let content = if accumulated_content.is_empty() {
+                    None
+                } else {
+                    Some(accumulated_content)
+                };
+
+                let final_tool_calls_option = if finalized_tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(finalized_tool_calls.clone())
+                };
+
+                // println!("\n\nFinal Tool Calls: \n{:?}\n\n", final_tool_calls_option);
+
+                let assistant_message = Message::assistant_with_tool_calls(content, final_tool_calls_option.clone());
+                current_messages.push(assistant_message.clone());
+
+                // --- Tool Call Handling ---
+                if let (Some(tools), Some(ref calls_to_invoke)) = (self.tools(), final_tool_calls_option.as_ref()) {
+                    if !calls_to_invoke.is_empty() {
+                        let mut tool_results = Messages::default();
+
+                        // Yield ToolCallRequested events for all finalized tool calls
+                        for tool_call in calls_to_invoke.iter() {
+                            yield AgentEvent::ToolCallRequested { tool_call: tool_call.clone() };
+                        }
+
+                        // Process tool calls sequentially for now - simpler
+                        for tool_call in calls_to_invoke.iter() {
+                            // Invoke the tool
+                            let result_messages = tools.invoke(tool_call).await;
+
+                            // Yield each resulting message as a ToolResult event
+                            for msg in result_messages.0.iter() {
+                                if let Message::Tool(tool_msg) = msg {
+                                    yield AgentEvent::ToolResult { message: tool_msg.clone() };
+                                }
+                            }
+
+                            // Add to tool results for history
+                            tool_results.extend(result_messages);
+                        }
+
+                        // Add tool results to history for the next iteration
+                        current_messages.extend(tool_results);
+                        // Continue to the next loop iteration
+                        continue;
+                    }
+                }
+
+                // --- No Tool Calls or Agent decides to finish ---
+                yield AgentEvent::AgentFinish;
+                break; // Exit the loop and finish the stream
             }
-        }) // End of try_stream!
+        })
     }
 }
 
@@ -553,6 +820,7 @@ where
 #[cfg(test)]
 mod tests {
     use schemars::{generate::SchemaSettings, schema_for};
+    use tokio_stream::StreamExt;
 
     use crate::{
         message::{ToolMessage, UserMessage},
@@ -754,53 +1022,212 @@ mod tests {
         }
     }
 
+    // Unit tests for tool call handling
+    #[test]
+    fn test_partial_tool_call_merge_and_finalize() {
+        // Create a partial tool call
+        let mut partial = PartialToolCall::default();
+
+        // Create some fragments
+        let fragment1 = ToolCall {
+            index: Some(0),
+            id: Some("call_123".to_string()),
+            type_field: "function".to_string(),
+            function: crate::response::FunctionCall {
+                name: Some("TestTool".to_string()),
+                arguments: "{".to_string(), // Start of JSON
+            },
+        };
+
+        let fragment2 = ToolCall {
+            index: Some(0),
+            id: Some("".to_string()), // Empty as it's a continuation
+            type_field: "".to_string(),
+            function: crate::response::FunctionCall {
+                name: None,
+                arguments: "\"a\":5,".to_string(), // Middle of JSON
+            },
+        };
+
+        let fragment3 = ToolCall {
+            index: Some(0),
+            id: Some("".to_string()),
+            type_field: "".to_string(),
+            function: crate::response::FunctionCall {
+                name: None,
+                arguments: "\"b\":7}".to_string(), // End of JSON
+            },
+        };
+
+        // Merge the fragments
+        partial.merge(&fragment1);
+        partial.merge(&fragment2);
+        partial.merge(&fragment3);
+
+        // Finalize and check the result
+        let finalized = partial.finalize().expect("Should finalize successfully");
+
+        assert_eq!(finalized.id, Some("call_123".to_string()));
+        assert_eq!(finalized.function.name, Some("TestTool".to_string()));
+        assert_eq!(finalized.function.arguments, "{\"a\":5,\"b\":7}");
+    }
+
+    #[test]
+    fn test_partial_tool_calls_manager() {
+        // Create the PartialToolCalls manager
+        let mut manager = PartialToolCallsAggregator::new();
+
+        // Create tool call deltas for two different tool calls
+        let delta1_first = ToolCall {
+            index: Some(0),
+            id: Some("call_123".to_string()),
+            type_field: "function".to_string(),
+            function: crate::response::FunctionCall {
+                name: Some("ToolOne".to_string()),
+                arguments: "{\"param\":".to_string(),
+            },
+        };
+
+        let delta1_second = ToolCall {
+            index: Some(0),
+            id: Some("".to_string()),
+            type_field: "".to_string(),
+            function: crate::response::FunctionCall {
+                name: None,
+                arguments: "\"value\"}".to_string(),
+            },
+        };
+
+        let delta2_first = ToolCall {
+            index: Some(1),
+            id: Some("call_456".to_string()),
+            type_field: "function".to_string(),
+            function: crate::response::FunctionCall {
+                name: Some("ToolTwo".to_string()),
+                arguments: "{\"x\":10,".to_string(),
+            },
+        };
+
+        let delta2_second = ToolCall {
+            index: Some(1),
+            id: Some("".to_string()),
+            type_field: "".to_string(),
+            function: crate::response::FunctionCall {
+                name: None,
+                arguments: "\"y\":20}".to_string(),
+            },
+        };
+
+        // Add all deltas to the manager
+        manager.add_delta(&delta1_first);
+        manager.add_delta(&delta2_first);
+        manager.add_delta(&delta1_second);
+        manager.add_delta(&delta2_second);
+
+        // Finalize and check results
+        let finalized = manager.finalize();
+
+        // We should have two tool calls
+        assert_eq!(finalized.len(), 2, "Should have two finalized tool calls");
+
+        // They should be sorted by index
+        assert_eq!(finalized[0].index, Some(0));
+        assert_eq!(finalized[1].index, Some(1));
+
+        // Check first tool call
+        assert_eq!(finalized[0].id, Some("call_123".to_string()));
+        assert_eq!(finalized[0].function.name, Some("ToolOne".to_string()));
+        assert_eq!(finalized[0].function.arguments, "{\"param\":\"value\"}");
+
+        // Check second tool call
+        assert_eq!(finalized[1].id, Some("call_456".to_string()));
+        assert_eq!(finalized[1].function.name, Some("ToolTwo".to_string()));
+        assert_eq!(finalized[1].function.arguments, "{\"x\":10,\"y\":20}");
+    }
+
     #[tokio::test]
-    async fn schema_test() {
-        // --- New Top-Level Struct ---
-        /// Represents the complete extracted information from a plant protection product label document.
-        #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-        #[serde(rename_all = "snake_case")]
-        pub struct CompleteProductLabelDto {
-            /// Title of the document.
-            pub title: String,
-            /// A brief summary or description. Two sentences.
-            pub description: String,
-            /// Keywords associated with the label.
-            pub tags: Vec<String>,
-            /// Detailed structured data extracted from the product label content.
-            pub label_data: ProductLabelDataDto,
-        }
-        #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-        #[serde(rename_all = "snake_case")]
-        pub struct ProductLabelDataDto {
-            pub name: String,
-            pub price: f32,
-            pub qty: u32,
-        }
-
-        // let value = serde_json::to_string_pretty(&CompleteProductLabelDto::default()).unwrap();
-        // println!("{}", value);
-
-        // let mut schema_settings =SchemaSettings::draft2020_12();
-        // schema_settings.inline_subschemas = true;
-        // let generator = schema_settings.into_generator();
-        // let schema = generator.into_root_schema_for::<CompleteProductLabelDto>();
-        // let schema_json = serde_json::to_string_pretty(&schema).unwrap();
-        // println!("{}", schema_json);
-
+    // #[ignore] // Ignored by default to avoid making API calls unless explicitly run
+    async fn test_agent_run_events() {
         let openrouter = create_openrouter();
-        let agent = SimpleTypedAgent::<CompleteProductLabelDto>::builder()
-            .name("test")
-            .openrouter(openrouter)
-            .model("google/gemini-2.0-flash-001")
-            .build();
+        let tools = ToolBox::builder().tool(CalculatorTool::default()).build();
+        let agent = CalculatorAgent { openrouter, tools };
+        let message = UserMessage::new(vec!["What is 5 + 7?"]);
 
-        let response = agent
-            .once_structured(UserMessage::new(vec![
-                "fill the structure with random data",
-            ]))
-            .await;
-        dbg!(response);
+        // Use run_events to get a detailed stream of agent execution events
+        let mut event_stream = agent.run_events(message).await;
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Some(event_result) = event_stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    println!("Received event: {:?}", event);
+                    events.push(event);
+                }
+                Err(e) => panic!("Agent event stream error: {:?}", e),
+            }
+        }
+
+        // Verify that we received the expected event types in the correct sequence
+        assert!(!events.is_empty(), "Should receive at least some events");
+
+        // First event should be AgentStart
+        assert!(
+            matches!(events[0], AgentEvent::AgentStart),
+            "First event should be AgentStart"
+        );
+
+        // Last event should be AgentFinish
+        assert!(
+            matches!(events.last().unwrap(), AgentEvent::AgentFinish),
+            "Last event should be AgentFinish"
+        );
+
+        // Verify we have the expected event types
+        let has_text_chunks = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextChunk { .. }));
+        assert!(has_text_chunks, "Should have at least one TextChunk event");
+
+        let has_stream_end = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::StreamEnd { .. }));
+        assert!(has_stream_end, "Should have at least one StreamEnd event");
+
+        // Tool events are optional depending on whether the agent needed to use tools
+        let has_tool_calls = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallRequested { .. }));
+        let has_tool_results = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolResult { .. }));
+
+        // If a tool was called, we should also have its result
+        if has_tool_calls {
+            assert!(
+                has_tool_results,
+                "If there are tool calls, there should be tool results"
+            );
+
+            // Find ToolResult events to check if they contain the expected result (12)
+            let tool_results: Vec<_> = events
+                .iter()
+                .filter_map(|e| {
+                    if let AgentEvent::ToolResult { message } = e {
+                        Some(message.content.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // At least one tool result should contain the answer (12)
+            let contains_answer = tool_results.iter().any(|content| content.contains("12"));
+            assert!(
+                contains_answer,
+                "Tool results should contain the expected answer (12)"
+            );
+        }
     }
 
     // Test requires implementing Tool for Agent first (commented out above)
