@@ -146,6 +146,7 @@ impl<'de> Deserialize<'de> for Choice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ToolCall {
+    pub index: Option<usize>,
     pub id: String,
     #[serde(rename = "type")]
     pub type_field: String,
@@ -265,4 +266,6 @@ pub struct ChunkChoice {
 pub struct Delta {
     pub role: Option<String>,
     pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }

@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, pin::Pin};
 
 use async_trait::async_trait;
 use bon::Builder;
@@ -6,11 +6,12 @@ use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     message::{Message, Messages, SystemMessage},
     response::ChatCompletionResponse,
-    tool::{AnyTool, Tool, ToolBox},
+    tool::{Tool, ToolBox},
     ApiRequestError, OpenRouter,
 };
 
@@ -86,6 +87,29 @@ pub trait BaseAgent: Send + Sync {
             .send()
             .await
     }
+    async fn stream_once(
+        &self,
+        messages: impl Into<Messages> + Send,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
+        >,
+    > {
+        Box::pin(
+            self.openrouter()
+                .chat_completion()
+                .model(self.model())
+                .messages(messages.into())
+                .maybe_max_tokens(self.max_tokens())
+                .maybe_temperature(self.temperature())
+                .maybe_top_p(self.top_p())
+                .maybe_stop(self.stop_sequences().cloned())
+                .maybe_tools(self.tools().cloned())
+                .build()
+                .stream()
+                .await,
+        )
+    }
 }
 
 #[async_trait]
@@ -129,6 +153,90 @@ pub trait Agent: BaseAgent {
         Err(AgentError::MaxIterationsReached {
             limit: self.max_iterations(),
         })
+    }
+
+    /// Runs the agent, potentially multiple times if tools are involved,
+    /// streaming the final response chunks or returning an error.
+    ///
+    /// This method handles tool interactions like `run`, but streams the
+    /// final assistant message chunk by chunk. If tool calls occur, they are
+    /// processed internally, and the next LLM call is made. Only the *final*
+    /// response (after all tool calls are handled) is streamed back.
+    ///
+    /// Returns a pinned, boxed stream of `Result<ChatCompletionChunk, AgentError>`.
+    /// The stream will yield `AgentError` if an API error occurs during intermediate
+    /// steps or if the maximum number of iterations is reached before a final
+    /// response is generated. The stream's lifetime is tied to the agent instance.
+    async fn run_stream<'a>(
+        &'a self,
+        messages: impl Into<Messages> + Send,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<crate::response::ChatCompletionChunk, AgentError>> + Send + 'a,
+        >,
+    > {
+        // Prepare initial messages including system instructions
+        let mut agent_messages = Messages::default();
+        if let Some(instructions) = self.instructions() {
+            agent_messages.push(SystemMessage::from(vec![instructions]));
+        }
+        // Note: `messages.into()` consumes the input. Ensure it's handled correctly regarding lifetimes/ownership.
+        // If `messages` needs to be used after this call, the caller should clone it first.
+        agent_messages.extend(messages.into());
+
+        let max_iter = self.max_iterations();
+
+        // Note: Requires the `async-stream` crate.
+        Box::pin(async_stream::try_stream! {
+
+            let mut current_messages = agent_messages;
+            let mut final_stream_completed = false;
+
+            for iteration in 0..max_iter {
+                // Use `once` internally to get a full response and check for tool calls
+                // before deciding whether to stream the final answer or loop for tool execution.
+                let resp = self.once(current_messages.clone()).await?; // Propagates AgentError if API call fails
+                let assistant_message = Message::from(resp.clone());
+                current_messages.push(assistant_message);
+
+                // Check if the response contains tool calls and if the agent has tools defined
+                if let (Some(tools), Some(tool_calls)) = (self.tools(), resp.tool_calls()) {
+                    // If there are tool calls, invoke them and add results back to the message history
+                    // TODO: Consider parallelizing tool calls if independent.
+                    for tool_call in tool_calls {
+                        // Assuming tools.invoke handles potential errors internally or returns them encapsulated in Messages
+                        // If invoke itself can fail critically, error handling might be needed here.
+                        let tool_result_msgs = tools.invoke(&tool_call).await;
+                        current_messages.extend(tool_result_msgs);
+                    }
+                    // Continue to the next iteration to get the model's response after processing tool results
+                } else {
+                    // No tool calls in this response (or agent has no tools).
+                    // The model intends this to be the final answer.
+                    // Now, stream this final answer using the accumulated context.
+                    // This requires a second call to the API, this time in streaming mode.
+                    // This is less efficient but necessary if tool calls aren't reliably streamed
+                    // or if intermediate non-streaming calls are required for complex logic.
+                    let mut final_stream = self.stream_once(current_messages.clone()).await;
+
+
+                    while let Some(chunk_result) = final_stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => yield chunk, // Yield the successful chunk
+                            Err(api_err) => Err(AgentError::from(api_err))?, // Map ApiRequestError to AgentError and yield/propagate error
+                        }
+                    }
+                    final_stream_completed = true;
+                    // Successfully streamed the final response, break the loop.
+                    break;
+                }
+            } // End of iteration loop
+
+            // Check if the loop finished because max_iterations was reached without generating and streaming a final response.
+            if !final_stream_completed {
+                Err(AgentError::MaxIterationsReached { limit: max_iter })?;
+            }
+        }) // End of try_stream!
     }
 }
 
@@ -684,9 +792,14 @@ mod tests {
         let agent = SimpleTypedAgent::<CompleteProductLabelDto>::builder()
             .name("test")
             .openrouter(openrouter)
-            .model("google/gemini-2.0-flash-001").build();
+            .model("google/gemini-2.0-flash-001")
+            .build();
 
-        let response = agent.once_structured(UserMessage::new(vec!["fill the structure with random data"])).await;
+        let response = agent
+            .once_structured(UserMessage::new(vec![
+                "fill the structure with random data",
+            ]))
+            .await;
         dbg!(response);
     }
 

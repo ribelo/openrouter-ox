@@ -141,7 +141,7 @@ impl Request {
 
     pub async fn stream(
         &self,
-    ) -> impl tokio_stream::Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> {
+    ) -> impl Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> {
         let url = format!("{}/{}", BASE_URL, API_URL);
         let mut body = serde_json::to_value(self).unwrap();
         body["stream"] = serde_json::Value::Bool(true);
@@ -166,6 +166,7 @@ impl Request {
                 Ok(s) => s,
                 Err(e) => return Some(Err(ApiRequestError::Stream(e.to_string()))),
             };
+            dbg!(&chunk_str);
             ChatCompletionChunk::from_streaming_line(&chunk_str)
         });
 
@@ -412,6 +413,50 @@ mod test {
             .await
             .unwrap();
         dbg!(&res);
+    }
+
+    #[tokio::test]
+    async fn test_stream_adding_tool() {
+        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+        pub struct AddingToolInput {
+            a: f32,
+            b: f32,
+        }
+        let adding_tool = SimpleTool::builder()
+            .name("adding_tool")
+            .handler(|input: AddingToolInput| async move {
+                let result = input.a + input.b;
+                Ok::<_, String>(serde_json::json!({ "result": result }))
+            })
+            .build();
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+        let client = reqwest::Client::new();
+        let openrouter = OpenRouter::builder()
+            .api_key(api_key)
+            .client(client)
+            .build();
+        let tools = ToolBox::builder().tool(adding_tool).build();
+        let mut messages = Messages::from(UserMessage::from(vec![
+            "This is a test, use adding tool with any value to verify if everything is working.",
+        ]));
+        // let mut messages = Messages::from(UserMessage::from(vec![
+        //     "Hello, how are you?",
+        // ]));
+        let mut stream = openrouter
+            .chat_completion()
+            .model("google/gemini-2.0-flash-001")
+            // .model("anthropic/claude-3.7-sonnet:beta")
+            .tools(tools.clone())
+            .messages(messages.clone())
+            .build()
+            .stream()
+            .await;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => println!("{:?}", chunk),
+                Err(_) => todo!(),
+            }
+        }
     }
 
     #[tokio::test]
