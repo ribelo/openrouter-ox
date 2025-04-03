@@ -137,7 +137,7 @@ impl Request {
         }
     }
 
-    pub async fn stream(
+    pub fn stream(
         &self,
     ) -> impl Stream<Item = Result<ChatCompletionChunk, ApiRequestError>> + Send + 'static {
         // Clone necessary owned data from `self` to ensure the stream closure
@@ -308,8 +308,7 @@ mod test {
             .model("anthropic/claude-3.5-sonnet:beta")
             .message(UserMessage::from(vec!["Hi, I'm John."]))
             .build()
-            .stream()
-            .await;
+            .stream();
         while let Some(res) = res.next().await {
             dbg!(res);
         }
@@ -506,8 +505,7 @@ mod test {
             .tools(tools.clone())
             .messages(messages.clone())
             .build()
-            .stream()
-            .await;
+            .stream();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => println!("{:?}", chunk),

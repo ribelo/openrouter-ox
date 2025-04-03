@@ -12,7 +12,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     message::{Message, Messages, SystemMessage, ToolMessage},
-    response::{ChatCompletionChunk, ChatCompletionResponse, FinishReason, ToolCall, Usage},
+    response::{ChatCompletionResponse, FinishReason, ToolCall, Usage},
     tool::{Tool, ToolBox},
     ApiRequestError, OpenRouter,
 };
@@ -295,7 +295,7 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
             .send()
             .await
     }
-    async fn stream_once(
+    fn stream_once(
         &self,
         messages: impl Into<Messages> + Send,
     ) -> Pin<
@@ -314,8 +314,7 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
                 .maybe_stop(self.stop_sequences().cloned())
                 .maybe_tools(self.tools().cloned())
                 .build()
-                .stream()
-                .await,
+                .stream(),
         )
     }
 }
@@ -377,7 +376,7 @@ pub trait Agent: BaseAgent {
     ///
     /// Returns a pinned, boxed stream of `Result<AgentEvent, AgentError>`.
     /// The stream yields events until the agent finishes or an error occurs.
-    async fn run_events(
+    fn run_events(
         &self,
         messages: impl Into<Messages> + Send,
     ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
@@ -407,7 +406,7 @@ pub trait Agent: BaseAgent {
                 iteration += 1;
 
                 // --- LLM Interaction ---
-                let mut api_stream = cloned_self.stream_once(current_messages.clone()).await;
+                let mut api_stream = cloned_self.stream_once(current_messages.clone());
 
                 let mut accumulated_content = String::new();
                 let mut partial_tool_calls = PartialToolCallsAggregator::new();
@@ -468,7 +467,7 @@ pub trait Agent: BaseAgent {
                 current_messages.push(assistant_message.clone());
 
                 // --- Tool Call Handling ---
-                if let (Some(tools), Some(ref calls_to_invoke)) = (cloned_self.tools(), final_tool_calls_option.as_ref()) {
+                if let (Some(tools), Some(calls_to_invoke)) = (cloned_self.tools(), final_tool_calls_option.as_ref()) {
                     if !calls_to_invoke.is_empty() {
                         let mut tool_results = Messages::default();
 
@@ -508,6 +507,13 @@ pub trait Agent: BaseAgent {
     }
 }
 
+// pub trait AgentArcExt: Clone {
+//     async fn run_events_shared(
+//         &self,
+//         messages: impl Into<Messages> + Send,
+//     ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>>;
+// }
+
 #[async_trait]
 pub trait TypedAgent: BaseAgent {
     type Output: JsonSchema + Serialize + DeserializeOwned;
@@ -537,7 +543,8 @@ pub trait TypedAgent: BaseAgent {
 
         // Extract the response content
         let json_str = resp
-            .choices.first()
+            .choices
+            .first()
             .and_then(|choice| choice.message.content.first())
             .map(|content| content.to_string())
             .ok_or_else(|| {
@@ -1150,11 +1157,11 @@ mod tests {
     async fn test_agent_run_events() {
         let openrouter = create_openrouter();
         let tools = ToolBox::builder().tool(CalculatorTool::default()).build();
-        let agent = CalculatorAgent { openrouter, tools };
+        let agent = Arc::new(CalculatorAgent { openrouter, tools });
         let message = UserMessage::new(vec!["What is 5 + 7?"]);
 
         // Use run_events to get a detailed stream of agent execution events
-        let mut event_stream = agent.run_events(message).await;
+        let mut event_stream = agent.run_events(message.clone());
 
         // Collect all events
         let mut events = Vec::new();
