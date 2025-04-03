@@ -1,5 +1,5 @@
 use bon::Builder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod message;
@@ -39,13 +39,13 @@ impl fmt::Debug for OpenRouter {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ErrorDetail {
     pub code: i32,
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
     pub user_id: Option<String>,
