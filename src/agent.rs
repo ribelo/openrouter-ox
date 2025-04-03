@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData, pin::Pin};
+use std::{collections::HashMap, marker::PhantomData, pin::Pin, sync::Arc};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -247,7 +247,7 @@ pub struct AgentInput {
 }
 
 #[async_trait]
-pub trait BaseAgent: Send + Sync {
+pub trait BaseAgent: Clone + Send + Sync + 'static {
     fn openrouter(&self) -> &OpenRouter;
     fn agent_name(&self) -> &str {
         std::any::type_name::<Self>().split("::").last().unwrap()
@@ -377,10 +377,10 @@ pub trait Agent: BaseAgent {
     ///
     /// Returns a pinned, boxed stream of `Result<AgentEvent, AgentError>`.
     /// The stream yields events until the agent finishes or an error occurs.
-    async fn run_events<'a>(
-        &'a self,
+    async fn run_events(
+        &self,
         messages: impl Into<Messages> + Send,
-    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
         let mut agent_messages = Messages::default();
         if let Some(instructions) = self.instructions() {
             agent_messages.push(SystemMessage::from(vec![instructions]));
@@ -389,6 +389,7 @@ pub trait Agent: BaseAgent {
 
         let max_iter = self.max_iterations();
 
+        let cloned_self = self.clone();
         Box::pin(try_stream! {
             yield AgentEvent::AgentStart;
 
@@ -406,7 +407,7 @@ pub trait Agent: BaseAgent {
                 iteration += 1;
 
                 // --- LLM Interaction ---
-                let mut api_stream = self.stream_once(current_messages.clone()).await;
+                let mut api_stream = cloned_self.stream_once(current_messages.clone()).await;
 
                 let mut accumulated_content = String::new();
                 let mut partial_tool_calls = PartialToolCallsAggregator::new();
@@ -467,7 +468,7 @@ pub trait Agent: BaseAgent {
                 current_messages.push(assistant_message.clone());
 
                 // --- Tool Call Handling ---
-                if let (Some(tools), Some(ref calls_to_invoke)) = (self.tools(), final_tool_calls_option.as_ref()) {
+                if let (Some(tools), Some(ref calls_to_invoke)) = (cloned_self.tools(), final_tool_calls_option.as_ref()) {
                     if !calls_to_invoke.is_empty() {
                         let mut tool_results = Messages::default();
 
@@ -536,9 +537,8 @@ pub trait TypedAgent: BaseAgent {
 
         // Extract the response content
         let json_str = resp
-            .choices
-            .get(0)
-            .and_then(|choice| choice.message.content.get(0))
+            .choices.first()
+            .and_then(|choice| choice.message.content.first())
             .map(|content| content.to_string())
             .ok_or_else(|| {
                 AgentError::ResponseParsingError(
@@ -755,7 +755,7 @@ pub struct SimpleTypedAgent<T: JsonSchema + Serialize + DeserializeOwned> {
 #[async_trait]
 impl<T> BaseAgent for SimpleTypedAgent<T>
 where
-    T: JsonSchema + Serialize + DeserializeOwned + Send + Sync,
+    T: Clone + JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     fn openrouter(&self) -> &OpenRouter {
         &self.openrouter
@@ -812,7 +812,7 @@ where
 #[async_trait]
 impl<T> TypedAgent for SimpleTypedAgent<T>
 where
-    T: JsonSchema + Serialize + DeserializeOwned + Send + Sync,
+    T: Clone + JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     type Output = T;
 }

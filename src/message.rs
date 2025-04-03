@@ -384,7 +384,7 @@ impl Message {
     pub fn assistant(content: impl Into<Content>) -> Self {
         Message::Assistant(AssistantMessage::new(content.into()))
     }
-    
+
     pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
         let assistant_msg = match content {
             Some(content_text) if !content_text.is_empty() => {
@@ -404,7 +404,7 @@ impl Message {
                 }
             }
         };
-        
+
         Message::Assistant(assistant_msg)
     }
 }
