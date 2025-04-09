@@ -882,7 +882,7 @@ mod tests {
             Some("You are a calculator. Evaluate the mathematical expression.".to_string())
         }
         fn model(&self) -> &str {
-            "openai/gpt-4o-mini"
+            "google/gemini-2.0-flash-001"
         }
         fn tools(&self) -> Option<&ToolBox> {
             Some(&self.tools)
@@ -992,7 +992,6 @@ mod tests {
         let message = UserMessage::new(vec!["What is 2 + 2?"]);
         // Use once_structured for a direct API call expecting a specific JSON structure
         let resp = agent.once_structured(message).await;
-        dbg!(&resp);
         match resp {
             Ok(r) => {
                 // 'r' is the parsed CalculatorResult
@@ -1028,6 +1027,23 @@ mod tests {
             Err(e) => panic!("Simple Agent run test failed: {:?}", e),
         }
     }
+
+    #[tokio::test]
+    #[ignore] // Ignored by default to avoid making API calls unless explicitly run
+    async fn test_simple_agent_run_events() {
+            let openrouter = create_openrouter();
+            let tools = ToolBox::builder().tool(CalculatorTool::default()).build();
+            let agent = CalculatorAgent { openrouter, tools };
+            let message = UserMessage::new(vec!["What is 5 + 8? Use calculator tool"]);
+            // Use run (even though this agent has no tools, it tests the Agent trait path)
+            let mut stream = agent.run_events(message);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(event) => println!("Event: {:?}", event),
+                    Err(e) => panic!("Event stream error: {:?}", e),
+                }
+            }
+        }
 
     // Unit tests for tool call handling
     #[test]

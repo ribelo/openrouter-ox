@@ -163,7 +163,6 @@ impl Request {
                 obj.insert("stream".to_string(), serde_json::Value::Bool(true));
                 body
             };
-            dbg!(&request_body);
 
             // Send the request asynchronously.
             let response = client
@@ -173,7 +172,6 @@ impl Request {
                 .send()
                 .await
                 .map_err(ApiRequestError::ReqwestError)?; // Propagate reqwest errors
-            dbg!(&response);
 
             // Check if the initial HTTP response indicates failure.
             if !response.status().is_success() {
