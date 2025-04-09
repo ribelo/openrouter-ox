@@ -146,6 +146,7 @@ impl<'de> Deserialize<'de> for Choice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ToolCall {
+    #[serde(skip_serializing)]
     pub index: Option<usize>,
     pub id: Option<String>,
     #[serde(rename = "type")]
