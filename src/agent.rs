@@ -549,11 +549,23 @@ pub trait TypedAgent: BaseAgent {
         &self,
         messages: impl Into<Messages> + Send,
     ) -> Result<Self::Output, AgentError> {
+        let mut combined_messages = Messages::new();
+
+        // Add system instructions if they exist
+        if let Some(instructions) = self.instructions() {
+            if !instructions.is_empty() {
+                combined_messages.push(Message::system(instructions));
+            }
+        }
+
+        // Add the user-provided messages
+        combined_messages.extend(messages.into());
+
         let resp = self
             .openrouter()
             .chat_completion()
             .model(self.model())
-            .messages(messages.into())
+            .messages(combined_messages) // Use the combined messages
             .response_format::<Self::Output>() // Request JSON format matching T
             .maybe_max_tokens(self.max_tokens())
             .maybe_temperature(self.temperature())
@@ -577,11 +589,12 @@ pub trait TypedAgent: BaseAgent {
                     "Model response missing expected content structure".to_string(),
                 )
             })?;
-        let json_value: Value = serde_json::from_str(&json_str).unwrap();
-        println!(
-            "json_value:\n{}",
-            serde_json::to_string_pretty(&json_value).unwrap()
-        );
+        // Debug print (optional)
+        // let json_value: Value = serde_json::from_str(&json_str).unwrap();
+        // println!(
+        //     "json_value:\n{}",
+        //     serde_json::to_string_pretty(&json_value).unwrap()
+        // );
 
         // Parse the JSON string into type T
         serde_json::from_str::<Self::Output>(&json_str).map_err(AgentError::from)
