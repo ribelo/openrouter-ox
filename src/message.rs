@@ -447,6 +447,10 @@ impl From<ToolMessage> for Message {
 pub struct Messages(pub Vec<Message>);
 
 impl Messages {
+    pub fn new() -> Self {
+        Messages::default()
+    }
+
     pub fn push(&mut self, message: impl Into<Message>) {
         self.0.push(message.into());
     }
