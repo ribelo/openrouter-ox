@@ -635,7 +635,8 @@ mod tests {
     use crate::response::ToolCall;
 
     use super::{
-        AssistantMessage, Content, ContentPart, ImageContent, ImageUrl, Message, SystemMessage, ToolMessage,
+        AssistantMessage, Content, ContentPart, ImageContent, ImageUrl, Message, SystemMessage,
+        ToolMessage,
     };
 
     #[test]

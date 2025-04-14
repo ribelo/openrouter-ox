@@ -2,14 +2,14 @@ use bon::Builder;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod agent;
 pub mod message;
+pub mod models;
 pub mod provider_preference;
 pub mod request;
 pub mod response;
-pub mod tool;
-pub mod agent;
 pub mod router;
-pub mod models;
+pub mod tool;
 const BASE_URL: &str = "https://openrouter.ai";
 
 #[cfg(feature = "leaky-bucket")]
