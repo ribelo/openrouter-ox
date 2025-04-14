@@ -1,9 +1,8 @@
-use async_stream::{stream, try_stream};
+use async_stream::try_stream;
 use bon::Builder;
-use schemars::{generate::SchemaSettings, schema_for, JsonSchema};
+use schemars::{generate::SchemaSettings, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::{fs::try_exists, sync::mpsc};
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
@@ -242,11 +241,11 @@ mod test {
 
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tokio_stream::StreamExt;
 
     use crate::{
-        message::{Messages, ToolMessage, UserMessage},
+        message::{Messages, UserMessage},
         tool::{SimpleTool, Tool, ToolBox},
         OpenRouter,
     };
@@ -288,7 +287,7 @@ mod test {
         let res = openrouter
             .chat_completion()
             .model("google/gemini-2.0-flash-001")
-            .message(UserMessage::from(vec!["Hi, I'm John."]))
+            .message(UserMessage::text("Hi, I'm John."))
             .build()
             .send()
             .await;
@@ -306,7 +305,7 @@ mod test {
         let mut res = openai
             .chat_completion()
             .model("anthropic/claude-3.5-sonnet:beta")
-            .message(UserMessage::from(vec!["Hi, I'm John."]))
+            .message(UserMessage::text("Hi, I'm John."))
             .build()
             .stream();
         while let Some(res) = res.next().await {
@@ -330,7 +329,7 @@ mod test {
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
-            .message(UserMessage::from(vec!["ile to jest 2+2"]))
+            .message(UserMessage::text("ile to jest 2+2"))
             .response_format::<MyResult>()
             .build()
             .send()
@@ -437,9 +436,9 @@ mod test {
             .client(client)
             .build();
         let tools = ToolBox::builder().tool(adding_tool).build();
-        let mut messages = Messages::from(UserMessage::from(vec![
+        let mut messages = Messages::default().user(
             "This is a test, use adding tool with any value to verify if everything is working.",
-        ]));
+        );
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
@@ -463,7 +462,7 @@ mod test {
             .model("openai/gpt-4o-2024-11-20")
             // .model("anthropic/claude-3.7-sonnet:beta")
             .tools(tools.clone())
-            .messages(messages)
+            .messages(messages.clone())
             .build()
             .send()
             .await
@@ -492,9 +491,9 @@ mod test {
             .client(client)
             .build();
         let tools = ToolBox::builder().tool(adding_tool).build();
-        let mut messages = Messages::from(UserMessage::from(vec![
+        let messages = Messages::default().user(
             "This is a test, use adding tool with any value to verify if everything is working.",
-        ]));
+        );
         // let mut messages = Messages::from(UserMessage::from(vec![
         //     "Hello, how are you?",
         // ]));
@@ -560,9 +559,7 @@ mod test {
             .client(client)
             .build();
         let tools = ToolBox::builder().tool(Wikipedia).build();
-        let mut messages = Messages::from(UserMessage::from(vec![
-            "Search Apollo project on Wikipedia.",
-        ]));
+        let mut messages = Messages::default().user("Search Apollo project on Wikipedia.");
         let res = openrouter
             .chat_completion()
             .model("openai/gpt-4o-2024-11-20")
@@ -601,9 +598,7 @@ mod test {
 
         let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
         let openrouter = OpenRouter::builder().api_key(api_key).build();
-        let mut messages = Messages::from(UserMessage::from(vec![
-            "Can we live forever in the future?",
-        ]));
+        let mut messages = Messages::default().user("Can we live forever in the future?");
         let res = openrouter
             .chat_completion()
             .model("google/gemini-2.0-flash-001")

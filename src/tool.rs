@@ -264,12 +264,12 @@ impl<T: Tool + Send + Sync> AnyTool for T {
             Ok(input) => input,
             Err(e) => {
                 // Deserialization failed, return ToolMessage with the correct (expected) ID
-                return ToolMessage::builder()
+                return ToolMessage::new(
                     // Pass the ID as String
-                    .tool_call_id(tool_call_id_str.to_string())
-                    .content(ToolError::InputDeserializationFailed(e.to_string()).to_string())
-                    .build()
-                    .into();
+                    tool_call_id_str.to_string(),
+                    ToolError::InputDeserializationFailed(e.to_string()).to_string(),
+                )
+                .into();
             }
         };
 
@@ -278,12 +278,12 @@ impl<T: Tool + Send + Sync> AnyTool for T {
             Ok(messages) => messages, // Success, return the result messages
             Err(e) => {
                 // Invocation failed, return ToolMessage with the correct (expected) ID
-                ToolMessage::builder()
+                ToolMessage::new(
                     // Pass the ID as String
-                    .tool_call_id(tool_call_id_str.to_string())
-                    .content(e.to_string()) // Use the error from the tool
-                    .build()
-                    .into()
+                    tool_call_id_str.to_string(),
+                    e.to_string(), // Use the error from the tool
+                )
+                .into()
             }
         }
     }
@@ -357,11 +357,7 @@ where
                 let serialized = serde_json::to_string(&content)
                     .map_err(|e| format!("Failed to serialize output: {}", e))?;
 
-                Ok(ToolMessage::builder()
-                    .tool_call_id(tool_call_id)
-                    .content(serialized)
-                    .build()
-                    .into())
+                Ok(ToolMessage::new(tool_call_id, serialized).into())
             }
             Err(err) => Err(err.to_string()),
         }

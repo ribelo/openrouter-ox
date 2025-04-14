@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
-    message::{Message, Messages, SystemMessage, ToolMessage},
+    message::{AssistantMessage, Message, Messages, SystemMessage, ToolMessage},
     response::{ChatCompletionResponse, FinishReason, ToolCall, Usage},
     tool::{Tool, ToolBox},
     ApiRequestError, OpenRouter,
@@ -281,7 +281,7 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
         &self,
         messages: impl Into<Messages> + Send,
     ) -> Result<ChatCompletionResponse, ApiRequestError> {
-        let mut combined_messages = Messages::new();
+        let mut combined_messages = Messages::default();
 
         // Add system instructions if they exist
         if let Some(instructions) = self.instructions() {
@@ -315,7 +315,7 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
             dyn Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
         >,
     > {
-        let mut combined_messages = Messages::new();
+        let mut combined_messages = Messages::default();
 
         // Add system instructions if they exist
         if let Some(instructions) = self.instructions() {
@@ -356,7 +356,7 @@ pub trait Agent: BaseAgent {
         // Prepare initial messages including system instructions
         let mut agent_messages = Messages::default();
         if let Some(instructions) = self.instructions() {
-            agent_messages.push(SystemMessage::from(vec![instructions]));
+            agent_messages.push(SystemMessage::text(instructions));
         }
         agent_messages.extend(messages.into());
 
@@ -407,7 +407,9 @@ pub trait Agent: BaseAgent {
     ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
         let mut agent_messages = Messages::default();
         if let Some(instructions) = self.instructions() {
-            agent_messages.push(SystemMessage::from(vec![instructions]));
+            if !instructions.is_empty() {
+                agent_messages.push(SystemMessage::text(instructions));
+            }
         }
         agent_messages.extend(messages.into());
 
@@ -440,7 +442,6 @@ pub trait Agent: BaseAgent {
 
                 while let Some(chunk_result) = api_stream.next().await {
                     let chunk = chunk_result?; // Propagate API errors
-                    // println!("\n\nChunk: \n{:?}\n", chunk);
 
                     // Process choices in the chunk (usually just one)
                     for choice in &chunk.choices {
@@ -456,8 +457,8 @@ pub trait Agent: BaseAgent {
                                 partial_tool_calls.add_delta(delta_call);
                             }
                         }
-                        if let Some(ref reason) = choice.finish_reason {
-                            finish_reason = Some(reason.clone());
+                        if let Some(reason) = choice.finish_reason {
+                            finish_reason = Some(reason);
                         }
                     }
                     final_chunk_usage = chunk.usage.clone(); // Capture usage from the last chunk
@@ -474,25 +475,30 @@ pub trait Agent: BaseAgent {
                 };
 
                 // --- Process Accumulated Response ---
-                let content = if accumulated_content.is_empty() {
-                    None
+                // Create Content object from accumulated text
+                let message_content = if accumulated_content.is_empty() {
+                    crate::message::Content::default() // Empty Vec<ContentPart>
                 } else {
-                    Some(accumulated_content)
+                    crate::message::Content::from(accumulated_content) // Convert String to Content(vec![TextPart])
                 };
 
                 let final_tool_calls_option = if finalized_tool_calls.is_empty() {
                     None
                 } else {
-                    Some(finalized_tool_calls.clone())
+                    Some(finalized_tool_calls) // Clone here for potential later use
                 };
 
-                // println!("\n\nFinal Tool Calls: \n{:?}\n\n", final_tool_calls_option);
+                // Create AssistantMessage using its constructor with the content
+                // and then assign the finalized tool calls
+                let mut assistant_message = AssistantMessage::new(message_content); // Use the Content object
+                assistant_message.tool_calls = final_tool_calls_option.clone();     // Assign finalized tool calls
 
-                let assistant_message = Message::assistant_with_tool_calls(content, final_tool_calls_option.clone());
-                current_messages.push(assistant_message.clone());
+                current_messages.push(assistant_message); // Push the complete assistant message to history
 
                 // --- Tool Call Handling ---
+                // Use the Option directly here without unwrapping
                 if let (Some(tools), Some(calls_to_invoke)) = (cloned_self.tools(), final_tool_calls_option.as_ref()) {
+                     // Check if the vector inside the Option is non-empty
                     if !calls_to_invoke.is_empty() {
                         let mut tool_results = Messages::default();
 
@@ -503,14 +509,22 @@ pub trait Agent: BaseAgent {
 
                         // Process tool calls sequentially for now - simpler
                         for tool_call in calls_to_invoke.iter() {
-                            // Invoke the tool
-                            let result_messages = tools.invoke(tool_call).await;
+                            // Invoke the tool - ToolBox::invoke handles internal errors and returns Messages
+                            let result_messages = tools.invoke(tool_call).await; // Removed .map_err and ?
+
+                            // Check if the returned message is actually an error message from the tool invocation
+                            // This requires checking the content of the ToolMessage within result_messages
+                            // Note: ToolBox::invoke wraps errors from Tool::invoke and deserialization errors
+                            // into a ToolMessage with the error text as content.
+                            // We might want to propagate this as an AgentError instead of just a ToolResult event.
+                            // For now, just yield the result as is.
 
                             // Yield each resulting message as a ToolResult event
                             for msg in result_messages.0.iter() {
                                 if let Message::Tool(tool_msg) = msg {
                                     yield AgentEvent::ToolResult { message: tool_msg.clone() };
                                 }
+                                // Consider adding logic here to detect tool invocation errors and yield AgentEvent::AgentError if needed
                             }
 
                             // Add to tool results for history
@@ -525,8 +539,12 @@ pub trait Agent: BaseAgent {
                 }
 
                 // --- No Tool Calls or Agent decides to finish ---
-                yield AgentEvent::AgentFinish;
-                break; // Exit the loop and finish the stream
+                // Check finish reason *after* processing potential tool calls
+                if finish_reason != Some(FinishReason::ToolCalls) {
+                     yield AgentEvent::AgentFinish;
+                    break; // Exit the loop and finish the stream
+                }
+                // If finish_reason was ToolCalls but we didn't invoke any (e.g., bad tool call format), loop again
             }
         })
     }
@@ -549,7 +567,7 @@ pub trait TypedAgent: BaseAgent {
         &self,
         messages: impl Into<Messages> + Send,
     ) -> Result<Self::Output, AgentError> {
-        let mut combined_messages = Messages::new();
+        let mut combined_messages = Messages::default();
 
         // Add system instructions if they exist
         if let Some(instructions) = self.instructions() {
@@ -609,11 +627,11 @@ pub trait TypedAgent: BaseAgent {
         messages: impl Into<Messages> + Send,
     ) -> Result<Self::Output, AgentError> {
         // Prepare initial messages including system instructions
-        let mut combined_messages = Messages::new();
+        let mut combined_messages = Messages::default();
         if let Some(instructions) = self.instructions() {
             // Ensure instructions are not empty before adding
             if !instructions.is_empty() {
-                combined_messages.push(SystemMessage::from(vec![instructions]));
+                combined_messages.push(Message::system(instructions));
             }
         }
         combined_messages.extend(messages.into());
@@ -988,7 +1006,7 @@ mod tests {
             Some(&self.tools)
         }
 
-        fn openrouter(&self) ->  &OpenRouter {
+        fn openrouter(&self) -> &OpenRouter {
             &self.openrouter
         }
     }
