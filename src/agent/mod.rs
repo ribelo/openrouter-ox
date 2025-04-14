@@ -1,5 +1,6 @@
 mod error;
 mod events;
+mod executor;
 mod simple_agent;
 mod tool_call_aggregator;
 mod traits;
@@ -7,18 +8,18 @@ mod typed_agent;
 
 pub use error::AgentError;
 pub use events::{AgentErrorSerializable, AgentEvent};
+pub use executor::AgentExecutor;
 pub use simple_agent::SimpleAgent;
 pub use traits::{Agent, AgentInput, AnyAgent, BaseAgent, TypedAgent};
 pub use typed_agent::SimpleTypedAgent;
 
 #[cfg(test)]
 mod tests {
-    use schemars::{generate::SchemaSettings, schema_for};
+    use async_trait::async_trait;
     use tokio_stream::StreamExt;
 
     use crate::{
-        message::{ToolMessage, UserMessage},
-        tool::Tool,
+        message::{Messages, ToolMessage, UserMessage}, response::ChatCompletionResponse, tool::Tool, ApiRequestError
     };
 
     use super::*;
@@ -45,7 +46,7 @@ mod tests {
             &self,
             tool_call_id: &str,
             input: Self::Input,
-        ) -> Result<crate::message::Messages, Self::Error> {
+        ) -> Result<Messages, Self::Error> {
             Ok(ToolMessage::new(tool_call_id, (input.a + input.b).to_string()).into())
         }
     }
@@ -56,10 +57,8 @@ mod tests {
         tools: crate::tool::ToolBox,
     }
 
+    #[async_trait]
     impl BaseAgent for CalculatorAgent {
-        fn openrouter(&self) -> &crate::OpenRouter {
-            &self.openrouter
-        }
         fn agent_name(&self) -> &str {
             "CalculatorAgent"
         }
@@ -75,17 +74,71 @@ mod tests {
         fn tools(&self) -> Option<&crate::tool::ToolBox> {
             Some(&self.tools)
         }
+
+        async fn once(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> Result<ChatCompletionResponse, ApiRequestError> {
+            executor.execute_once(self, messages).await
+        }
+
+        fn stream_once(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
+            >,
+        > {
+            executor.stream_once(self, messages)
+        }
     }
     // Implement the Agent trait for CalculatorAgent
-    impl Agent for CalculatorAgent {}
+    #[async_trait]
+    impl Agent for CalculatorAgent {
+        async fn run(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> Result<ChatCompletionResponse, AgentError> {
+            executor.execute_run(self, messages).await
+        }
+
+        fn run_events(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
+            executor.stream_run(self, messages)
+        }
+    }
 
     #[derive(Debug, schemars::JsonSchema, serde::Serialize, serde::Deserialize)]
     pub struct CalculatorResult {
         pub value: f64,
     }
 
+    #[async_trait]
     impl TypedAgent for CalculatorAgent {
         type Output = CalculatorResult;
+
+        async fn once_typed(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> Result<Self::Output, AgentError> {
+            executor.execute_once_typed(self, messages).await
+        }
+
+        async fn run_typed(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> Result<Self::Output, AgentError> {
+            executor.execute_run_typed(self, messages).await
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -94,6 +147,7 @@ mod tests {
         tools: crate::tool::ToolBox,
     }
 
+    #[async_trait]
     impl BaseAgent for OrchestratorAgent {
         fn agent_name(&self) -> &str {
             "Orchestrator"
@@ -112,12 +166,45 @@ mod tests {
             Some(&self.tools)
         }
 
-        fn openrouter(&self) -> &crate::OpenRouter {
-            &self.openrouter
+        async fn once(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> Result<ChatCompletionResponse, ApiRequestError> {
+            executor.execute_once(self, messages).await
+        }
+
+        fn stream_once(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
+            >,
+        > {
+            executor.stream_once(self, messages)
         }
     }
     // Implement the Agent trait for OrchestratorAgent
-    impl Agent for OrchestratorAgent {}
+    #[async_trait]
+    impl Agent for OrchestratorAgent {
+        async fn run(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> Result<ChatCompletionResponse, AgentError> {
+            executor.execute_run(self, messages).await
+        }
+
+        fn run_events(
+            &self,
+            executor: &AgentExecutor,
+            messages: impl Into<Messages> + Send,
+        ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
+            executor.stream_run(self, messages)
+        }
+    }
 
     #[derive(schemars::JsonSchema, serde::Serialize, serde::Deserialize)]
     pub struct CalculatorAgentQuestion {
@@ -137,10 +224,11 @@ mod tests {
             &self,
             tool_call_id: &str,
             input: Self::Input,
-        ) -> Result<crate::message::Messages, Self::Error> {
+        ) -> Result<Messages, Self::Error> {
             let question = input.question;
+            let executor = AgentExecutor::new(self.openrouter.clone());
             let response = self
-                .once_typed(UserMessage::new(vec![question]))
+                .once_typed(&executor, UserMessage::new(vec![question]))
                 .await
                 .unwrap();
             Ok(ToolMessage::new(tool_call_id, serde_json::to_string(&response).unwrap()).into())
@@ -158,13 +246,14 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_simple_agent() {
         let openrouter = create_openrouter();
+        let executor = AgentExecutor::new(openrouter.clone());
         let tools = crate::tool::ToolBox::builder()
             .tool(CalculatorTool::default())
             .build();
         let agent = CalculatorAgent { openrouter, tools };
         let message = UserMessage::new(vec!["What is 2 + 2?"]);
-        // Use once for a direct API call
-        let resp = agent.run(message).await;
+        // Use run with the executor
+        let resp = agent.run(&executor, message).await;
         match resp {
             Ok(r) => {
                 println!("Simple Agent Response: {:?}", r);
@@ -178,13 +267,14 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_simple_typed_agent_once() {
         let openrouter = create_openrouter();
+        let executor = AgentExecutor::new(openrouter.clone());
         let tools = crate::tool::ToolBox::builder()
             .tool(CalculatorTool::default())
             .build();
         let agent = CalculatorAgent { openrouter, tools };
         let message = UserMessage::new(vec!["What is 2 + 2?"]);
-        // Use once_structured for a direct API call expecting a specific JSON structure
-        let resp = agent.once_typed(message).await;
+        // Use once_typed with the executor
+        let resp = agent.once_typed(&executor, message).await;
         match resp {
             Ok(r) => {
                 // 'r' is the parsed CalculatorResult
@@ -205,13 +295,14 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_simple_agent_run() {
         let openrouter = create_openrouter();
+        let executor = AgentExecutor::new(openrouter.clone());
         let tools = crate::tool::ToolBox::builder()
             .tool(CalculatorTool::default())
             .build();
         let agent = CalculatorAgent { openrouter, tools };
         let message = UserMessage::new(vec!["What is 5 * 8?"]);
-        // Use run (even though this agent has no tools, it tests the Agent trait path)
-        let resp = agent.run(message).await;
+        // Use run with the executor
+        let resp = agent.run(&executor, message).await;
         match resp {
             Ok(r) => {
                 println!("Simple Agent Run Response: {:?}", r);
@@ -227,13 +318,14 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_simple_agent_run_events() {
         let openrouter = create_openrouter();
+        let executor = AgentExecutor::new(openrouter.clone());
         let tools = crate::tool::ToolBox::builder()
             .tool(CalculatorTool::default())
             .build();
         let agent = CalculatorAgent { openrouter, tools };
         let message = UserMessage::new(vec!["What is 5 + 8? Use calculator tool"]);
-        // Use run (even though this agent has no tools, it tests the Agent trait path)
-        let mut stream = agent.run_events(message);
+        // Use run_events with the executor
+        let mut stream = agent.run_events(&executor, message);
         while let Some(event) = stream.next().await {
             match event {
                 Ok(event) => println!("Event: {:?}", event),
@@ -246,14 +338,15 @@ mod tests {
     // #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_agent_run_events() {
         let openrouter = create_openrouter();
+        let executor = AgentExecutor::new(openrouter.clone());
         let tools = crate::tool::ToolBox::builder()
             .tool(CalculatorTool::default())
             .build();
         let agent = Arc::new(CalculatorAgent { openrouter, tools });
         let message = UserMessage::new(vec!["What is 5 + 7?"]);
 
-        // Use run_events to get a detailed stream of agent execution events
-        let mut event_stream = agent.run_events(message.clone());
+        // Use run_events with the executor to get a detailed stream of agent execution events
+        let mut event_stream = agent.run_events(&executor, message.clone());
 
         // Collect all events
         let mut events = Vec::new();
@@ -334,6 +427,7 @@ mod tests {
     // #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     // async fn test_orchestrator_with_tool() {
     //     let openrouter = create_openrouter();
+    //     let executor = AgentExecutor::new(openrouter.clone());
     //     let tools = ToolBox::builder().tool(CalculatorTool::default()).build();
     //     let calculator_agent = CalculatorAgent { openrouter, tools };
 
@@ -344,7 +438,7 @@ mod tests {
     //     let message = UserMessage::new(vec!["Please calculate 123 + 456 for me."]);
 
     //     // Use run for the orchestrator to potentially use tools
-    //     let resp = orchestrator.run(message).await;
+    //     let resp = orchestrator.run(&executor, message).await;
 
     //     match resp {
     //         Ok(r) => {

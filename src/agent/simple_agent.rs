@@ -1,14 +1,21 @@
 use async_trait::async_trait;
 use bon::Builder;
+use std::pin::Pin;
+use tokio_stream::Stream;
 
+use super::error::AgentError;
+use super::events::AgentEvent;
+use super::executor::AgentExecutor;
 use super::traits::{Agent, BaseAgent};
-use crate::{tool::Tool, tool::ToolBox, OpenRouter};
+use crate::{
+    message::Messages, response::ChatCompletionResponse, tool::Tool, tool::ToolBox,
+    ApiRequestError, OpenRouter,
+};
 
 #[derive(Debug, Clone, Builder)]
 pub struct SimpleAgent {
     #[builder(field)]
     pub tools: Option<ToolBox>,
-    pub openrouter: OpenRouter,
     #[builder(into)]
     pub description: Option<String>,
     #[builder(into)]
@@ -40,10 +47,6 @@ impl<S: simple_agent_builder::State> SimpleAgentBuilder<S> {
 
 #[async_trait]
 impl BaseAgent for SimpleAgent {
-    fn openrouter(&self) -> &OpenRouter {
-        &self.openrouter
-    }
-
     fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
@@ -83,8 +86,44 @@ impl BaseAgent for SimpleAgent {
     fn max_iterations(&self) -> usize {
         self.max_iterations.unwrap_or(12)
     }
+
+    async fn once(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Result<ChatCompletionResponse, ApiRequestError> {
+        executor.execute_once(self, messages).await
+    }
+
+    fn stream_once(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
+        >,
+    > {
+        executor.stream_once(self, messages)
+    }
 }
 
 // Implement Agent for SimpleAgent
 #[async_trait]
-impl Agent for SimpleAgent {}
+impl Agent for SimpleAgent {
+    async fn run(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Result<ChatCompletionResponse, AgentError> {
+        executor.execute_run(self, messages).await
+    }
+
+    fn run_events(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
+        executor.stream_run(self, messages)
+    }
+}

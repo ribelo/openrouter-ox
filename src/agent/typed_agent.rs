@@ -1,16 +1,21 @@
 use std::marker::PhantomData;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
+use tokio_stream::Stream;
 
+use super::error::AgentError;
+use super::executor::AgentExecutor;
 use super::traits::{BaseAgent, TypedAgent};
-use crate::{tool::ToolBox, OpenRouter};
+use crate::{
+    message::Messages, response::ChatCompletionResponse, tool::ToolBox, ApiRequestError, OpenRouter,
+};
 
 #[derive(Debug, Clone, Builder)]
 pub struct SimpleTypedAgent<T: JsonSchema + Serialize + DeserializeOwned> {
-    pub openrouter: OpenRouter,
     #[builder(into)]
     pub name: Option<String>,
     #[builder(into)]
@@ -35,10 +40,6 @@ impl<T> BaseAgent for SimpleTypedAgent<T>
 where
     T: Clone + JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    fn openrouter(&self) -> &OpenRouter {
-        &self.openrouter
-    }
-
     fn agent_name(&self) -> &str {
         self.name
             .as_deref()
@@ -84,6 +85,26 @@ where
     fn max_iterations(&self) -> usize {
         self.max_iterations.unwrap_or(12)
     }
+
+    async fn once(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Result<ChatCompletionResponse, ApiRequestError> {
+        executor.execute_once(self, messages).await
+    }
+
+    fn stream_once(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
+        >,
+    > {
+        executor.stream_once(self, messages)
+    }
 }
 
 // Implement TypedAgent for SimpleTypedAgent
@@ -93,4 +114,20 @@ where
     T: Clone + JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     type Output = T;
+
+    async fn once_typed(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Result<Self::Output, AgentError> {
+        executor.execute_once_typed(self, messages).await
+    }
+
+    async fn run_typed(
+        &self,
+        executor: &AgentExecutor,
+        messages: impl Into<Messages> + Send,
+    ) -> Result<Self::Output, AgentError> {
+        executor.execute_run_typed(self, messages).await
+    }
 }
