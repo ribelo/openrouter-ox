@@ -95,25 +95,6 @@ mod tests {
             executor.stream_once(self, messages)
         }
     }
-    // Implement the Agent trait for CalculatorAgent
-    #[async_trait]
-    impl Agent for CalculatorAgent {
-        async fn run(
-            &self,
-            executor: &AgentExecutor,
-            messages: impl Into<Messages> + Send,
-        ) -> Result<ChatCompletionResponse, AgentError> {
-            executor.execute_run(self, messages).await
-        }
-
-        fn run_events(
-            &self,
-            executor: &AgentExecutor,
-            messages: impl Into<Messages> + Send,
-        ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
-            executor.stream_run(self, messages)
-        }
-    }
 
     #[derive(Debug, schemars::JsonSchema, serde::Serialize, serde::Deserialize)]
     pub struct CalculatorResult {
@@ -184,25 +165,6 @@ mod tests {
             >,
         > {
             executor.stream_once(self, messages)
-        }
-    }
-    // Implement the Agent trait for OrchestratorAgent
-    #[async_trait]
-    impl Agent for OrchestratorAgent {
-        async fn run(
-            &self,
-            executor: &AgentExecutor,
-            messages: impl Into<Messages> + Send,
-        ) -> Result<ChatCompletionResponse, AgentError> {
-            executor.execute_run(self, messages).await
-        }
-
-        fn run_events(
-            &self,
-            executor: &AgentExecutor,
-            messages: impl Into<Messages> + Send,
-        ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
-            executor.stream_run(self, messages)
         }
     }
 
@@ -325,7 +287,7 @@ mod tests {
         let agent = CalculatorAgent { openrouter, tools };
         let message = UserMessage::new(vec!["What is 5 + 8? Use calculator tool"]);
         // Use run_events with the executor
-        let mut stream = agent.run_events(&executor, message);
+        let mut stream = agent.stream_run(&executor, message);
         while let Some(event) = stream.next().await {
             match event {
                 Ok(event) => println!("Event: {:?}", event),
@@ -346,7 +308,7 @@ mod tests {
         let message = UserMessage::new(vec!["What is 5 + 7?"]);
 
         // Use run_events with the executor to get a detailed stream of agent execution events
-        let mut event_stream = agent.run_events(&executor, message.clone());
+        let mut event_stream = agent.stream_run(&executor, message.clone());
 
         // Collect all events
         let mut events = Vec::new();

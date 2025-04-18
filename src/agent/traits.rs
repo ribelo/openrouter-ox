@@ -1,4 +1,4 @@
-use std::pin::Pin;
+use std::{error::Error, pin::Pin};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -10,10 +10,7 @@ use super::error::AgentError;
 use super::events::AgentEvent;
 use super::executor::AgentExecutor;
 use crate::{
-    message::Messages,
-    response::ChatCompletionResponse,
-    tool::ToolBox,
-    ApiRequestError, OpenRouter,
+    message::Messages, response::{ChatCompletionResponse, ToolCall}, tool::ToolBox, ApiRequestError, OpenRouter,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -29,7 +26,9 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
     fn agent_name(&self) -> &str {
         std::any::type_name::<Self>().split("::").last().unwrap()
     }
-    fn description(&self) -> Option<&str>;
+    fn description(&self) -> Option<&str> {
+        None
+    }
     fn instructions(&self) -> Option<String>;
     fn model(&self) -> &str;
     fn max_tokens(&self) -> Option<u32> {
@@ -60,7 +59,9 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
         &self,
         executor: &AgentExecutor,
         messages: impl Into<Messages> + Send,
-    ) -> Result<ChatCompletionResponse, ApiRequestError>;
+    ) -> Result<ChatCompletionResponse, ApiRequestError> {
+        executor.execute_once(self, messages).await
+    }
 
     /// Creates a streaming response for a single call to the chat completion API.
     /// Uses the provided executor to perform the actual API call.
@@ -72,7 +73,56 @@ pub trait BaseAgent: Clone + Send + Sync + 'static {
         Box<
             dyn Stream<Item = Result<crate::response::ChatCompletionChunk, ApiRequestError>> + Send,
         >,
-    >;
+    > {
+        executor.stream_once(self, messages)
+    }
+
+    /// Asynchronous hook invoked for each tool call requested by the model,
+    /// acting as middleware before potential execution.
+    ///
+    /// This method allows the agent implementation to intercept a specific `ToolCall`
+    /// and decide how to handle it. It can:
+    /// 1.  **Inspect:** Examine the tool name and arguments.
+    /// 2.  **Modify:** Change the `ToolCall` (e.g., alter arguments) before potentially executing it.
+    /// 3.  **Execute:** Call the actual tool implementation (e.g., using `self.tools().invoke()`)
+    ///     and return its resulting `Messages`.
+    /// 4.  **Handle Directly:** Generate `Messages` without calling the actual tool (e.g.,
+    ///     return a cached response, ask the user for confirmation and return their input
+    ///     as a message, return a "permission denied" message).
+    /// 5.  **Reject/Error:** Return an `Err(AgentError)` if the hook logic fails or if
+    ///     the tool call should definitively halt the agent's execution.
+    ///
+    /// # Arguments
+    /// * `tool_call`: The specific `ToolCall` proposed by the LLM for this step.
+    ///
+    /// # Returns
+    /// - `Ok(Messages)`: One or more messages resulting from handling the tool call
+    ///   (either by direct handling in the hook or by invoking the underlying tool).
+    ///   These messages will be added to the conversation history for the next LLM turn.
+    /// - `Err(AgentError)`: An error indicating a failure in the hook or underlying
+    ///   tool execution that should stop the agent run. This could be a
+    ///   `AgentError::ToolError` if the tool itself failed, or `AgentError::CallbackError`
+    ///   if the hook logic failed.
+    ///
+    /// # Default Implementation
+    /// The default implementation directly invokes the corresponding tool from the
+    /// agent's `ToolBox` using `self.tools().unwrap().invoke(&tool_call).await`.
+    /// It assumes the agent has tools configured if this is called.
+    /// Override this method in your agent implementation to add custom middleware logic.
+    async fn invoke_tool(
+        &self,
+        tool_call: ToolCall,
+    ) -> Result<Messages, AgentError> {
+        // Default: Directly invoke the tool via the ToolBox
+        match self.tools() {
+            Some(toolbox) => Ok(toolbox.invoke(&tool_call).await),
+            None => Err(AgentError::InternalError(format!(
+                "Agent '{}' received tool call for '{}' but has no ToolBox configured.",
+                self.agent_name(),
+                tool_call.function.name.as_deref().unwrap_or("<unknown>")
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -84,7 +134,9 @@ pub trait Agent: BaseAgent {
         &self,
         executor: &AgentExecutor,
         messages: impl Into<Messages> + Send,
-    ) -> Result<ChatCompletionResponse, AgentError>;
+    ) -> Result<ChatCompletionResponse, AgentError> {
+        executor.execute_run(self, messages).await
+    }
 
     /// Runs the agent, streaming events like text chunks, tool calls, and results.
     /// Uses the provided executor to perform the execution.
@@ -97,12 +149,16 @@ pub trait Agent: BaseAgent {
     /// - StreamEnd: When a model turn completes
     /// - AgentFinish: When the agent successfully completes its task
     /// - AgentError: When an error occurs during execution
-    fn run_events(
+    fn stream_run(
         &self,
         executor: &AgentExecutor,
         messages: impl Into<Messages> + Send,
-    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>>;
+    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
+        executor.stream_run(self, messages)
+    }
 }
+
+impl<T: BaseAgent> Agent for T {}
 
 #[async_trait]
 pub trait TypedAgent: BaseAgent {
@@ -115,7 +171,9 @@ pub trait TypedAgent: BaseAgent {
         &self,
         executor: &AgentExecutor,
         messages: impl Into<Messages> + Send,
-    ) -> Result<Self::Output, AgentError>;
+    ) -> Result<Self::Output, AgentError> {
+        executor.execute_once_typed(self, messages).await
+    }
 
     /// Runs the agent potentially multiple times, handling tool calls, until a structured
     /// response `Output` is obtained or the maximum number of iterations is reached.
@@ -124,7 +182,9 @@ pub trait TypedAgent: BaseAgent {
         &self,
         executor: &AgentExecutor,
         messages: impl Into<Messages> + Send,
-    ) -> Result<Self::Output, AgentError>;
+    ) -> Result<Self::Output, AgentError> {
+        executor.execute_run_typed(self, messages).await
+    }
 }
 
 // Note: The AnyAgent trait and its implementation have potential design issues

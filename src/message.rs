@@ -235,7 +235,7 @@ impl From<String> for SystemMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
-    content: Content,
+    pub content: Content,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
@@ -417,6 +417,21 @@ impl AssistantMessage {
     /// Add a content part to the message.
     pub fn push_content(&mut self, content: impl Into<ContentPart>) {
         self.content.push(content.into());
+    }
+
+    /// Add a text string to the last content part if it's a text part,
+    /// otherwise add a new text content part.
+    pub fn push_string(&mut self, text: impl Into<String>) {
+        let text_string = text.into();
+
+        if let Some(ContentPart::Text(text_content)) = self.content.last_mut() {
+            text_content.text.push_str(&text_string);
+            return;
+        }
+
+        // If we get here, either there's no content or the last part isn't text
+        self.content
+            .push(ContentPart::Text(TextContent::new(text_string)));
     }
 
     /// Check if the message content is empty.

@@ -107,23 +107,3 @@ impl BaseAgent for SimpleAgent {
         executor.stream_once(self, messages)
     }
 }
-
-// Implement Agent for SimpleAgent
-#[async_trait]
-impl Agent for SimpleAgent {
-    async fn run(
-        &self,
-        executor: &AgentExecutor,
-        messages: impl Into<Messages> + Send,
-    ) -> Result<ChatCompletionResponse, AgentError> {
-        executor.execute_run(self, messages).await
-    }
-
-    fn run_events(
-        &self,
-        executor: &AgentExecutor,
-        messages: impl Into<Messages> + Send,
-    ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>> {
-        executor.stream_run(self, messages)
-    }
-}

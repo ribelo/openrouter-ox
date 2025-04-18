@@ -30,6 +30,13 @@ pub struct OpenRouter {
     leaky_bucket: Option<Arc<RateLimiter>>,
 }
 
+impl OpenRouter {
+    pub fn new_from_env() -> Result<Self, std::env::VarError> {
+        let api_key = std::env::var("OPENROUTER_API_KEY")?;
+        Ok(Self::builder().api_key(api_key).build())
+    }
+}
+
 impl fmt::Debug for OpenRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAi")

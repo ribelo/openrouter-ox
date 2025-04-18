@@ -110,7 +110,7 @@ impl AgentExecutor {
     pub async fn execute_run<A>(
         &self,
         agent: &A,
-        initial_messages: impl Into<Messages> + Send,
+        messages: impl Into<Messages> + Send,
     ) -> Result<ChatCompletionResponse, AgentError>
     where
         A: Agent,
@@ -120,7 +120,7 @@ impl AgentExecutor {
         if let Some(instructions) = agent.instructions() {
             agent_messages.push(SystemMessage::text(instructions));
         }
-        agent_messages.extend(initial_messages.into());
+        agent_messages.extend(messages.into());
 
         // Loop for handling tool interactions or getting a final response
         for _ in 0..agent.max_iterations() {
@@ -130,10 +130,10 @@ impl AgentExecutor {
             agent_messages.push(agent_message);
 
             // Check if the response contains tool calls
-            if let (Some(tools), Some(tool_calls)) = (agent.tools(), resp.tool_calls()) {
+            if let (Some(_tools), Some(tool_calls)) = (agent.tools(), resp.tool_calls()) {
                 // If there are tool calls, invoke them and add results to messages
                 for tool_call in tool_calls {
-                    let msgs = tools.invoke(&tool_call).await;
+                    let msgs = agent.invoke_tool(tool_call).await?;
                     agent_messages.extend(msgs);
                 }
             } else {
@@ -166,7 +166,7 @@ impl AgentExecutor {
     pub fn stream_run<A>(
         &self,
         agent: &A,
-        initial_messages: impl Into<Messages> + Send,
+        messages: impl Into<Messages> + Send,
     ) -> Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>>
     where
         A: Agent,
@@ -177,7 +177,7 @@ impl AgentExecutor {
                 agent_messages.push(SystemMessage::text(instructions));
             }
         }
-        agent_messages.extend(initial_messages.into());
+        agent_messages.extend(messages.into());
 
         let max_iter = agent.max_iterations();
         let agent_clone = agent.clone();
@@ -264,7 +264,7 @@ impl AgentExecutor {
 
                 // --- Tool Call Handling ---
                 // Use the Option directly here without unwrapping
-                if let (Some(tools), Some(calls_to_invoke)) = (agent_clone.tools(), final_tool_calls_option.as_ref()) {
+                if let (Some(_tools), Some(calls_to_invoke)) = (agent_clone.tools(), final_tool_calls_option) {
                      // Check if the vector inside the Option is non-empty
                     if !calls_to_invoke.is_empty() {
                         let mut tool_results = Messages::default();
@@ -275,9 +275,10 @@ impl AgentExecutor {
                         }
 
                         // Process tool calls sequentially for now - simpler
-                        for tool_call in calls_to_invoke.iter() {
+                        for tool_call in calls_to_invoke {
                             // Invoke the tool - ToolBox::invoke handles internal errors and returns Messages
-                            let result_messages = tools.invoke(tool_call).await; // Removed .map_err and ?
+                            let result_messages = agent_clone.invoke_tool(tool_call).await?; // Removed .map_err and ?
+                            // let result_messages = tools.invoke(&tool_call).await; // Removed .map_err and ?
 
                             // Check if the returned message is actually an error message from the tool invocation
                             // This requires checking the content of the ToolMessage within result_messages
@@ -291,7 +292,6 @@ impl AgentExecutor {
                                 if let Message::Tool(tool_msg) = msg {
                                     yield AgentEvent::ToolResult { message: tool_msg.clone() };
                                 }
-                                // Consider adding logic here to detect tool invocation errors and yield AgentEvent::AgentError if needed
                             }
 
                             // Add to tool results for history
