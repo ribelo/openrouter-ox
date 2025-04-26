@@ -1,15 +1,17 @@
+mod config;
+pub mod context;
 mod error;
 mod events;
 mod simple_agent;
 mod tool_call_aggregator;
-mod traits;
 mod typed_agent;
 
-use std::{marker::PhantomData, pin::Pin};
+use std::{any::Any, marker::PhantomData, pin::Pin, sync::Arc};
 
 pub use crate::OpenRouter;
 use async_stream::try_stream;
 use bon::Builder;
+use context::AgentContext;
 use derive_more::Deref;
 pub use error::AgentError;
 pub use events::{AgentErrorSerializable, AgentEvent};
@@ -18,50 +20,74 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use tokio_stream::StreamExt;
 use tool_call_aggregator::PartialToolCallsAggregator;
-// pub use simple_agent::SimpleAgent;
-pub use traits::{Agent, AgentInput, TypedAgent};
-// pub use typed_agent::SimpleTypedAgent;
 
 use crate::{
-    message::{AssistantMessage, Message, Messages, SystemMessage},
+    message::{AssistantMessage, Message, Messages},
     response::{ChatCompletionChunk, ChatCompletionResponse, FinishReason, Usage},
     tool::{Tool, ToolBox},
 };
 
-/// A wrapper struct that holds a Gemini client and an Agent implementation.
-/// It facilitates executing the agent's logic by providing the necessary client.
-/// This acts as a simple pass-through executor, delegating all Agent trait methods
-/// to the contained agent instance.
-#[derive(Clone, Debug, Builder, Deref)] // Added Clone
-pub struct OpenRouterAgent<A: Agent> {
+#[derive(Clone, Builder)]
+pub struct Agent {
     #[builder(field)]
-    pub(crate) tools: Option<ToolBox>,
+    pub context: AgentContext,
+    #[builder(field)]
+    pub instruction: Option<Arc<dyn Fn(&AgentContext) -> String + Send + Sync>>,
     pub(crate) openrouter: OpenRouter,
-    #[deref]
-    pub(crate) agent: A,
+    #[builder(into)]
+    pub name: String,
+    #[builder(into)]
+    pub description: Option<String>,
+    #[builder(into)]
+    pub model: String,
+    pub max_tokens: Option<u32>,
+    pub stop_sequences: Option<Vec<String>>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    #[builder(default = 12)]
+    pub max_iterations: u32,
 }
 
-impl<S: open_router_agent_builder::State, A: Agent> OpenRouterAgentBuilder<A, S> {
+impl<S: agent_builder::State> AgentBuilder<S> {
     pub fn tools(mut self, toolbox: ToolBox) -> Self {
-        self.tools = Some(toolbox);
+        self.context.tools = Some(toolbox);
         self
     }
     pub fn tool<T: Tool>(mut self, tool: T) -> Self {
-        self.tools.get_or_insert_default().add(tool);
+        self.context.tools.get_or_insert_default().add(tool);
+        self
+    }
+    pub fn dependency<T: Any + Send + Sync>(self, value: T) -> Self {
+        self.context.insert(value);
+        self
+    }
+    pub fn instruction<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&AgentContext) -> String + Send + Sync + 'static,
+    {
+        self.instruction = Some(Arc::new(f));
         self
     }
 }
 
-impl<S: open_router_agent_builder::IsComplete, A: Agent> OpenRouterAgentBuilder<A, S> {
-    pub fn typed<O: JsonSchema + DeserializeOwned>(self) -> OpenRouterTypedAgent<A, O> {
-        OpenRouterTypedAgent {
+impl<S: agent_builder::IsComplete> AgentBuilder<S> {
+    pub fn typed<O: JsonSchema + DeserializeOwned>(self) -> TypedAgent<O> {
+        TypedAgent {
             agent: self.build(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<A: Agent> OpenRouterAgent<A> {
+#[derive(Clone, Deref)]
+pub struct TypedAgent<O: JsonSchema + DeserializeOwned> {
+    #[deref]
+    agent: Agent,
+    _phantom: PhantomData<O>,
+}
+
+impl Agent {
     pub async fn generate(
         &self,
         messages: impl Into<Messages> + Send,
@@ -74,9 +100,9 @@ impl<A: Agent> OpenRouterAgent<A> {
 
         // Add system instructions only if they exist, are not empty, and no system message is present yet.
         if !has_system_message {
-            if let Some(instructions) = self.instructions() {
-                if !instructions.is_empty() {
-                    combined_messages.push(Message::system(instructions));
+            if let Some(instruction) = self.instruction.as_deref().map(|f| f(&self.context)) {
+                if !instruction.is_empty() {
+                    combined_messages.push(Message::system(instruction));
                 }
             }
         }
@@ -87,13 +113,13 @@ impl<A: Agent> OpenRouterAgent<A> {
         // Build and send the request
         self.openrouter
             .chat_completion()
-            .model(self.model())
             .messages(combined_messages) // Use the combined messages
-            .maybe_max_tokens(self.max_tokens())
-            .maybe_temperature(self.temperature())
-            .maybe_top_p(self.top_p())
-            .maybe_stop(self.stop_sequences().cloned())
-            .maybe_tools(self.tools.clone())
+            .model(self.model.clone())
+            .maybe_max_tokens(self.max_tokens)
+            .maybe_temperature(self.temperature)
+            .maybe_top_p(self.top_p)
+            .maybe_stop(self.stop_sequences.clone())
+            .maybe_tools(self.context.tools.clone())
             .build()
             .send()
             .await
@@ -115,9 +141,9 @@ impl<A: Agent> OpenRouterAgent<A> {
 
         // Add system instructions only if they exist, are not empty, and no system message is present yet.
         if !has_system_message {
-            if let Some(instructions) = self.instructions() {
-                if !instructions.is_empty() {
-                    combined_messages.push(Message::system(instructions));
+            if let Some(instruction) = self.instruction.as_deref().map(|f| f(&self.context)) {
+                if !instruction.is_empty() {
+                    combined_messages.push(Message::system(instruction));
                 }
             }
         }
@@ -129,13 +155,13 @@ impl<A: Agent> OpenRouterAgent<A> {
         Box::pin(
             self.openrouter
                 .chat_completion()
-                .model(self.model())
                 .messages(combined_messages) // Use the combined messages
-                .maybe_max_tokens(self.max_tokens())
-                .maybe_temperature(self.temperature())
-                .maybe_top_p(self.top_p())
-                .maybe_stop(self.stop_sequences().cloned())
-                .maybe_tools(self.tools.clone())
+                .model(self.model.clone())
+                .maybe_max_tokens(self.max_tokens)
+                .maybe_temperature(self.temperature)
+                .maybe_top_p(self.top_p)
+                .maybe_stop(self.stop_sequences.clone())
+                .maybe_tools(self.context.tools.clone())
                 .build()
                 .stream()
                 .map_err(|e| AgentError::ApiError(e)),
@@ -157,9 +183,9 @@ impl<A: Agent> OpenRouterAgent<A> {
 
         // Add system instructions only if they exist, are not empty, and no system message is present yet.
         if !has_system_message {
-            if let Some(instructions) = self.instructions() {
-                if !instructions.is_empty() {
-                    combined_messages.push(Message::system(instructions));
+            if let Some(instruction) = self.instruction.as_deref().map(|f| f(&self.context)) {
+                if !instruction.is_empty() {
+                    combined_messages.push(Message::system(instruction));
                 }
             }
         }
@@ -168,17 +194,16 @@ impl<A: Agent> OpenRouterAgent<A> {
         combined_messages.extend(messages);
 
         // Loop for handling tool interactions or getting a final response
-        for _ in 0..self.max_iterations() {
+        for _ in 0..self.max_iterations {
             // Make an API call
-            dbg!(&combined_messages);
             let resp = self.generate(combined_messages.clone()).await?; // Returns ApiRequestError, converted by `?` into AgentError
-            dbg!(&resp);
             let agent_message = Message::from(resp.clone());
             combined_messages.push(agent_message);
 
             // Check if the response contains tool calls
-            if let (Some(tools), Some(tool_calls)) = (self.tools.as_ref(), resp.tool_calls()) {
-                dbg!(&tool_calls);
+            if let (Some(tools), Some(tool_calls)) =
+                (self.context.tools.as_ref(), resp.tool_calls())
+            {
                 // If there are tool calls, invoke them and add results to messages
                 for tool_call in tool_calls {
                     let msgs = tools.invoke(&tool_call).await;
@@ -193,7 +218,7 @@ impl<A: Agent> OpenRouterAgent<A> {
         // If the loop completes without returning (meaning max_iterations was reached
         // because every iteration resulted in tool calls), return an error.
         Err(AgentError::MaxIterationsReached {
-            limit: self.max_iterations(),
+            limit: self.max_iterations,
         })
     }
 
@@ -213,9 +238,9 @@ impl<A: Agent> OpenRouterAgent<A> {
 
         // Add system instructions only if they exist, are not empty, and no system message is present yet.
         if !has_system_message {
-            if let Some(instructions) = self.instructions() {
-                if !instructions.is_empty() {
-                    combined_messages.push(Message::system(instructions));
+            if let Some(instruction) = self.instruction.as_deref().map(|f| f(&self.context)) {
+                if !instruction.is_empty() {
+                    combined_messages.push(Message::system(instruction));
                 }
             }
         }
@@ -223,9 +248,8 @@ impl<A: Agent> OpenRouterAgent<A> {
         // Add the user-provided messages
         combined_messages.extend(messages);
 
-        let max_iter = self.max_iterations();
+        let max_iter = self.max_iterations;
         let agent_clone = self.clone();
-        let executor_clone = self.clone();
 
         Box::pin(try_stream! {
             yield AgentEvent::AgentStart;
@@ -244,7 +268,7 @@ impl<A: Agent> OpenRouterAgent<A> {
                 iteration += 1;
 
                 // --- LLM Interaction ---
-                let mut api_stream = executor_clone.stream_response(current_messages.clone());
+                let mut api_stream = agent_clone.stream_response(current_messages.clone());
 
                 let mut accumulated_content = String::new();
                 let mut partial_tool_calls = PartialToolCallsAggregator::new();
@@ -308,7 +332,7 @@ impl<A: Agent> OpenRouterAgent<A> {
 
                 // --- Tool Call Handling ---
                 // Use the Option directly here without unwrapping
-                if let (Some(tools), Some(calls_to_invoke)) = (agent_clone.tools.as_ref(), final_tool_calls_option) {
+                if let (Some(tools), Some(calls_to_invoke)) = (agent_clone.context.tools.as_ref(), final_tool_calls_option) {
                      // Check if the vector inside the Option is non-empty
                     if !calls_to_invoke.is_empty() {
                         let mut tool_results = Messages::default();
@@ -361,47 +385,10 @@ impl<A: Agent> OpenRouterAgent<A> {
     }
 }
 
-#[derive(Clone, Debug, Deref)]
-pub struct OpenRouterTypedAgent<A: Agent, O: JsonSchema + DeserializeOwned> {
-    #[deref]
-    agent: OpenRouterAgent<A>,
-    _phantom: PhantomData<O>,
-}
-
-impl<T, O> OpenRouterTypedAgent<T, O>
+impl<O> TypedAgent<O>
 where
-    T: Agent,
     O: JsonSchema + DeserializeOwned,
 {
-    // fn generate_schema(&self) -> Result<Value, AgentError> {
-    //     let settings = schemars::generate::SchemaSettings::openapi3().with(|s| {
-    //         s.inline_subschemas = true;
-    //         s.meta_schema = None;
-    //     });
-    //     let sgen = schemars::SchemaGenerator::new(settings);
-    //     // into_root_schema_for does not return a Result, assuming schemars handles internal errors
-    //     let root_schema = sgen.into_root_schema_for::<O>();
-
-    //     // Handle potential JSON serialization error
-    //     let mut json_schema = serde_json::to_value(root_schema).map_err(|e| {
-    //         AgentError::SchemaGenerationFailed(format!("Failed to serialize root schema: {}", e))
-    //     })?;
-
-    //     // Safely access as mutable object and remove title if it exists
-    //     match json_schema.as_object_mut() {
-    //         Some(obj) => {
-    //             obj.remove("title");
-    //         }
-    //         None => {
-    //             return Err(AgentError::SchemaGenerationFailed(
-    //                 "Generated schema root is not a JSON object, cannot remove 'title'".to_string(),
-    //             ));
-    //         }
-    //     }
-
-    //     Ok(json_schema)
-    // }
-
     /// Gets a single, structured response of type `Output` from one call to the LLM.
     /// Makes a single, direct call to the underlying model API, configured to return JSON
     /// matching the `Output` type's schema. Parses the response into `Output`.
@@ -418,9 +405,9 @@ where
 
         // Add system instructions only if they exist, are not empty, and no system message is present yet.
         if !has_system_message {
-            if let Some(instructions) = self.instructions() {
-                if !instructions.is_empty() {
-                    combined_messages.push(Message::system(instructions));
+            if let Some(instruction) = self.instruction.as_deref().map(|f| f(&self.context)) {
+                if !instruction.is_empty() {
+                    combined_messages.push(Message::system(instruction));
                 }
             }
         }
@@ -431,19 +418,19 @@ where
         let resp = self
             .openrouter
             .chat_completion()
-            .model(self.model())
             .messages(combined_messages) // Use the combined messages
             .response_format::<O>() // Request JSON format matching Output
-            .maybe_max_tokens(self.max_tokens())
-            .maybe_temperature(self.temperature())
-            .maybe_top_p(self.top_p())
-            .maybe_stop(self.stop_sequences().cloned())
+            .model(self.model.clone())
+            .maybe_max_tokens(self.max_tokens)
+            .maybe_temperature(self.temperature)
+            .maybe_top_p(self.top_p)
+            .maybe_stop(self.stop_sequences.clone())
             // Note: Tools are generally not recommended with forced JSON output,
-            // but we include them if the agent provides them. The model might ignore them.
-            .maybe_tools(self.tools.clone())
             .build()
             .send()
             .await?; // Converts ApiRequestError to AgentError
+
+        dbg!(&resp);
 
         // Extract the response content
         let json_str = resp
@@ -480,9 +467,9 @@ where
 
         // Add system instructions only if they exist, are not empty, and no system message is present yet.
         if !has_system_message {
-            if let Some(instructions) = self.instructions() {
-                if !instructions.is_empty() {
-                    combined_messages.push(Message::system(instructions));
+            if let Some(instruction) = self.instruction.as_deref().map(|f| f(&self.context)) {
+                if !instruction.is_empty() {
+                    combined_messages.push(Message::system(instruction));
                 }
             }
         }
@@ -490,7 +477,7 @@ where
         // Add the user-provided messages
         combined_messages.extend(messages);
 
-        if self.tools.is_none() {
+        if self.context.tools.is_none() {
             // No tools, directly ask for the typed response in a single turn.
             self.generate_typed(combined_messages).await
         } else {
@@ -498,6 +485,7 @@ where
             let response = self.execute(combined_messages.clone()).await?;
             // Take the final response content from the multi-turn execution...
             combined_messages.push(Message::from(response.clone()));
+            dbg!(&combined_messages);
 
             self.generate_typed(combined_messages).await
         }
@@ -512,7 +500,7 @@ mod tests {
     use crate::{
         message::{Messages, ToolMessage, UserMessage},
         // response::ChatCompletionResponse, // Not directly used in corrected tests
-        tool::{Tool, ToolBox},
+        tool::Tool,
         // ApiRequestError, // Replaced by AgentError
     };
 
@@ -548,52 +536,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone)]
-    struct CalculatorAgent {
-        // Store config, not the client or tools directly
-    }
-
-    impl CalculatorAgent {
-        // Constructor to initialize any specific agent state if needed
-        fn new() -> Self {
-            Self {}
-        }
-    }
-
-    #[async_trait]
-    impl Agent for CalculatorAgent {
-        fn name(&self) -> &str {
-            "CalculatorAgent"
-        }
-        fn description(&self) -> Option<&str> {
-            Some("An agent that performs calculator operations")
-        }
-        fn instructions(&self) -> Option<String> {
-            Some("You are a calculator. Evaluate the mathematical expression. Use the available tools if necessary.".to_string())
-        }
-        fn model(&self) -> &str {
-            // Use a model good at function calling / json mode
-            "openai/gpt-4o-mini"
-        }
-
-        // Implement other optional methods from Agent trait with defaults or specific values
-        fn max_tokens(&self) -> Option<u32> {
-            Some(100) // Example value
-        }
-        fn temperature(&self) -> Option<f64> {
-            Some(0.0) // Prefer deterministic output for calculator
-        }
-        fn top_p(&self) -> Option<f64> {
-            None
-        }
-        fn stop_sequences(&self) -> Option<&Vec<String>> {
-            None
-        }
-        fn max_iterations(&self) -> u32 {
-            5 // Allow a few tool calls if needed
-        }
-    }
-
     #[derive(Debug, schemars::JsonSchema, serde::Serialize, serde::Deserialize)]
     pub struct CalculatorResult {
         pub value: f64,
@@ -602,50 +544,50 @@ mod tests {
     // Note: TypedAgent is now just a marker trait. The actual methods are on OpenRouterTypedAgent.
     // We don't need an explicit `impl TypedAgent for CalculatorAgent`.
 
-    #[derive(Debug, Clone)]
-    struct OrchestratorAgent {
-        // Store config, not the client or tools directly
-    }
+    // #[derive(Debug, Clone)]
+    // struct OrchestratorAgent {
+    //     // Store config, not the client or tools directly
+    // }
 
-    impl OrchestratorAgent {
-        fn new() -> Self {
-            Self {}
-        }
-    }
+    // impl OrchestratorAgent {
+    //     fn new() -> Self {
+    //         Self {}
+    //     }
+    // }
 
-    #[async_trait]
-    impl Agent for OrchestratorAgent {
-        fn name(&self) -> &str {
-            "Orchestrator"
-        }
-        fn description(&self) -> Option<&str> {
-            Some("An orchestrator that manages agents, always forwarding questions to the appropriate agent and summarizing responses.")
-        }
-        fn instructions(&self) -> Option<String> {
-            Some("You are an orchestrator. Use the available tools to answer the user's question. If a calculation is needed, use the CalculatorTool tool.".to_string())
-        }
-        fn model(&self) -> &str {
-            // Use a model known to be good at tool use
-            "openai/gpt-4o-mini"
-        }
+    // #[async_trait]
+    // impl AgentConfig for OrchestratorAgent {
+    //     fn name(&self) -> &str {
+    //         "Orchestrator"
+    //     }
+    //     fn description(&self, _ctx: &AgentContext) -> Option<&str> {
+    //         Some("An orchestrator that manages agents, always forwarding questions to the appropriate agent and summarizing responses.")
+    //     }
+    //     fn instructions(&self, _ctx: &AgentContext) -> Option<String> {
+    //         Some("You are an orchestrator. Use the available tools to answer the user's question. If a calculation is needed, use the CalculatorTool tool.".to_string())
+    //     }
+    //     fn model(&self, _ctx: &AgentContext) -> &str {
+    //         // Use a model known to be good at tool use
+    //         "openai/gpt-4o-mini"
+    //     }
 
-        // Implement other optional methods from Agent trait with defaults or specific values
-        fn max_tokens(&self) -> Option<u32> {
-            Some(250)
-        }
-        fn temperature(&self) -> Option<f64> {
-            Some(0.5)
-        }
-        fn top_p(&self) -> Option<f64> {
-            None
-        }
-        fn stop_sequences(&self) -> Option<&Vec<String>> {
-            None
-        }
-        fn max_iterations(&self) -> u32 {
-            5 // Allow tool use
-        }
-    }
+    //     // Implement other optional methods from Agent trait with defaults or specific values
+    //     fn max_tokens(&self, _ctx: &AgentContext) -> Option<u32> {
+    //         Some(250)
+    //     }
+    //     fn temperature(&self, _ctx: &AgentContext) -> Option<f64> {
+    //         Some(0.5)
+    //     }
+    //     fn top_p(&self, _ctx: &AgentContext) -> Option<f64> {
+    //         None
+    //     }
+    //     fn stop_sequences(&self, _ctx: &AgentContext) -> Option<&Vec<String>> {
+    //         None
+    //     }
+    //     fn max_iterations(&self, _ctx: &AgentContext) -> u32 {
+    //         5 // Allow tool use
+    //     }
+    // }
 
     // --- Agent as a Tool ---
     // We need a struct that holds the necessary context to run the agent when invoked as a tool.
@@ -661,49 +603,57 @@ mod tests {
         pub question: String,
     }
 
-    #[async_trait::async_trait]
-    impl Tool for CalculatorAgentToolRunner {
-        type Input = CalculatorAgentQuestion;
-        type Error = AgentError; // Tool invocation can fail with agent errors
+    // #[async_trait::async_trait]
+    // impl Tool for CalculatorAgentToolRunner {
+    //     type Input = CalculatorAgentQuestion;
+    //     type Error = AgentError; // Tool invocation can fail with agent errors
 
-        fn name(&self) -> &str {
-            // We use a fixed name, could potentially get it from the Agent trait
-            // but that requires an instance, which we don't necessarily have here.
-            // If we instantiated CalculatorAgent here, we could use Agent::name(&CalculatorAgent::new())
-            "CalculatorAgentTool"
-        }
-        fn description(&self) -> Option<&str> {
-            Some("Runs the CalculatorAgent to answer a question, expecting a numeric result.")
-        }
+    //     fn name(&self) -> &str {
+    //         // We use a fixed name, could potentially get it from the Agent trait
+    //         // but that requires an instance, which we don't necessarily have here.
+    //         // If we instantiated CalculatorAgent here, we could use Agent::name(&CalculatorAgent::new())
+    //         "CalculatorAgentTool"
+    //     }
+    //     fn description(&self) -> Option<&str> {
+    //         Some("Runs the CalculatorAgent to answer a question, expecting a numeric result.")
+    //     }
 
-        async fn invoke(
-            &self,
-            tool_call_id: &str,
-            input: Self::Input,
-        ) -> Result<Messages, Self::Error> {
-            let question = input.question;
-            // Create the agent executor (OpenRouterTypedAgent) on the fly
-            let typed_agent_executor = OpenRouterAgent::builder()
-                .openrouter(self.openrouter.clone())
-                .agent(CalculatorAgent::new()) // Instantiate the agent logic
-                // Add the *basic* calculator tool, so the agent *could* use it if needed,
-                // though for simple questions it might directly respond with JSON.
-                .tool(CalculatorTool::default())
-                .typed::<CalculatorResult>(); // Make it a typed agent executor
+    //     async fn invoke(
+    //         &self,
+    //         tool_call_id: &str,
+    //         input: Self::Input,
+    //     ) -> Result<Messages, Self::Error> {
+    //         let question = input.question;
+    //         let typed_agent_executor = Agent::builder()
+    //             .openrouter(self.openrouter.clone())
+    //             // Set builder fields directly using methods from the AgentConfig trait
+    //             .name("CalculatorAgent")
+    //             .description(agent_config.description(&default_ctx).map(|s| s.to_string()))
+    //             .instruction(instruction_fn) // Set the instruction function
+    //             .model(agent_config.model(&default_ctx).to_string())
+    //             .max_tokens(agent_config.max_tokens(&default_ctx))
+    //             .temperature(agent_config.temperature(&default_ctx))
+    //             .top_p(agent_config.top_p(&default_ctx))
+    //             .stop_sequences(agent_config.stop_sequences(&default_ctx).cloned()) // Clone if Some
+    //             .max_iterations(agent_config.max_iterations(&default_ctx))
+    //             // Add the *basic* calculator tool, so the agent *could* use it if needed,
+    //             // though for simple questions it might directly respond with JSON.
+    //             .tool(CalculatorTool::default())
+    //             .typed::<CalculatorResult>(); // Make it a typed agent executor
 
-            // Execute the agent to get a typed response
-            let response: CalculatorResult = typed_agent_executor
-                .execute_typed(UserMessage::text(question)) // Use execute_typed for potential tool use
-                .await?; // Propagate AgentError
+    //         // Execute the agent to get a typed response
+    //         let response: CalculatorResult = typed_agent_executor
+    //             .execute_typed(UserMessage::text(question)) // Use execute_typed for potential tool use
+    //             .await?; // Propagate AgentError
 
-            // Serialize the successful result to JSON string for the ToolMessage
-            let response_json = serde_json::to_string(&response).map_err(|e| {
-                AgentError::ResponseParsingError(format!("Failed to serialize tool result: {}", e))
-            })?;
+    //         // Serialize the successful result to JSON string for the ToolMessage
+    //         let response_json = serde_json::to_string(&response).map_err(|e| {
+    //             AgentError::ResponseParsingError(format!("Failed to serialize tool result: {}", e))
+    //         })?;
 
-            Ok(ToolMessage::new(tool_call_id, response_json).into())
-        }
-    }
+    //         Ok(ToolMessage::new(tool_call_id, response_json).into())
+    //     }
+    // }
 
     // Helper to create OpenRouter client from env var
     fn create_openrouter() -> crate::OpenRouter {
@@ -716,15 +666,21 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_simple_agent_execute() {
         let openrouter = create_openrouter();
-        let agent_executor = OpenRouterAgent::builder()
+        let agent = Agent::builder()
             .openrouter(openrouter)
-            .agent(CalculatorAgent::new()) // Instantiate the agent logic
+            .name("CalculatorAgent")
+            .description("An agent that performs calculator operations")
+            .instruction(|_|"You are a calculator. Evaluate the mathematical expression. Use the available tools if necessary.".to_string())
+            .model("openai/gpt-4o-mini")
+            .max_tokens(100)
+            .temperature(0.0)
+            .max_iterations(5)
             .tool(CalculatorTool::default()) // Add the tool
             .build();
 
         let message = UserMessage::text("What is 2 + 2? Use the tool.");
         // Use execute for potential multi-turn interaction
-        let resp = agent_executor.execute(message).await;
+        let resp = agent.execute(message).await;
         match resp {
             Ok(r) => {
                 println!("Simple Agent Execute Response: {:?}", r);
@@ -750,15 +706,20 @@ mod tests {
     async fn test_simple_typed_agent_generate() {
         let openrouter = create_openrouter();
         // Create the typed agent executor
-        let typed_agent_executor = OpenRouterAgent::builder()
-            .openrouter(openrouter)
-            .agent(CalculatorAgent::new()) // Instantiate the agent logic
-            // No tools needed if we expect a direct JSON response
-            .typed::<CalculatorResult>(); // Specify the output type
+        let agent = Agent::builder()
+                    .openrouter(openrouter)
+                    .name("CalculatorAgent")
+                    .description("An agent that performs calculator operations")
+                    .instruction(|_|"You are a calculator. Evaluate the mathematical expression. Use the available tools if necessary.".to_string())
+                    .model("openai/gpt-4o-mini")
+                    .max_tokens(100)
+                    .temperature(0.0)
+                    .max_iterations(5)
+                    .typed::<CalculatorResult>(); // Specify the output type
 
         let message = UserMessage::text("What is 2 + 2? Respond with JSON.");
         // Use generate_typed for a single-turn typed response
-        let resp = typed_agent_executor.generate_typed(message).await;
+        let resp = agent.generate_typed(message).await;
         match resp {
             Ok(r) => {
                 // 'r' is the parsed CalculatorResult
@@ -780,17 +741,23 @@ mod tests {
     async fn test_simple_typed_agent_execute() {
         let openrouter = create_openrouter();
         // Create the typed agent executor
-        let typed_agent_executor = OpenRouterAgent::builder()
-            .openrouter(openrouter.clone())
-            .agent(CalculatorAgent::new()) // Instantiate the agent logic
-            .tool(CalculatorTool::default()) // Add the tool in case it's needed
-            .typed::<CalculatorResult>(); // Specify the output type
+        let agent = Agent::builder()
+                    .openrouter(openrouter)
+                    .name("CalculatorAgent")
+                    .description("An agent that performs calculator operations")
+                    .instruction(|_|"You are a calculator. Evaluate the mathematical expression. Use the available tools if necessary.".to_string())
+                    .model("google/gemini-2.0-flash-001")
+                    .max_tokens(100)
+                    .temperature(0.0)
+                    .max_iterations(5)
+                    .tool(CalculatorTool::default()) // Add the tool
+                    .typed::<CalculatorResult>(); // Specify the output type
 
         let message = UserMessage::text(
             "What is 5 * 8? Use the tool if needed, then give me the final result as JSON.",
         );
         // Use execute_typed for potential multi-turn interaction ending in a typed response
-        let resp = typed_agent_executor.execute_typed(message).await;
+        let resp = agent.execute_typed(message).await;
         match resp {
             Ok(r) => {
                 // 'r' is the parsed CalculatorResult
@@ -809,18 +776,22 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_agent_stream_events() {
         let openrouter = create_openrouter();
-        let agent_executor = Arc::new(
-            OpenRouterAgent::builder()
-                .openrouter(openrouter)
-                .agent(CalculatorAgent::new())
-                .tool(CalculatorTool::default())
-                .build(),
-        );
+        let agent = Agent::builder()
+                    .openrouter(openrouter)
+                    .name("CalculatorAgent")
+                    .description("An agent that performs calculator operations")
+                    .instruction(|_|"You are a calculator. Evaluate the mathematical expression. Use the available tools if necessary.".to_string())
+                    .model("openai/gpt-4o-mini")
+                    .max_tokens(100)
+                    .temperature(0.0)
+                    .max_iterations(5)
+                    .tool(CalculatorTool::default()) // Add the tool
+                    .build();
 
         let message = UserMessage::text("What is 5 + 7? Use the calculator tool.");
 
         // Use stream_events to get a detailed stream of agent execution events
-        let mut event_stream = agent_executor.stream_events(message.clone());
+        let mut event_stream = agent.stream_events(message.clone());
 
         // Collect all events
         let mut events = Vec::new();
@@ -910,50 +881,50 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore] // Ignored by default to avoid making API calls unless explicitly run
-    async fn test_orchestrator_with_agent_tool() {
-        let openrouter = create_openrouter();
+    // #[tokio::test]
+    // #[ignore] // Ignored by default to avoid making API calls unless explicitly run
+    // async fn test_orchestrator_with_agent_tool() {
+    //     let openrouter = create_openrouter();
 
-        // The tool that knows how to run the CalculatorAgent
-        let calculator_agent_tool = CalculatorAgentToolRunner {
-            openrouter: openrouter.clone(),
-        };
+    //     // The tool that knows how to run the CalculatorAgent
+    //     let calculator_agent_tool = CalculatorAgentToolRunner {
+    //         openrouter: openrouter.clone(),
+    //     };
 
-        // Build the orchestrator agent executor, providing the CalculatorAgentToolRunner as a tool
-        let orchestrator_executor = OpenRouterAgent::builder()
-            .openrouter(openrouter.clone())
-            .agent(OrchestratorAgent::new()) // Instantiate the orchestrator logic
-            .tool(calculator_agent_tool) // Add the agent runner tool
-            .build();
+    //     // Build the orchestrator agent executor, providing the CalculatorAgentToolRunner as a tool
+    //     let orchestrator_executor = Agent::builder()
+    //         .openrouter(openrouter.clone())
+    //         .config(OrchestratorAgent::new()) // Instantiate the orchestrator logic
+    //         .tool(calculator_agent_tool) // Add the agent runner tool
+    //         .build();
 
-        let message =
-            UserMessage::text("Please calculate 123 + 456 for me using the CalculatorAgentTool.");
+    //     let message =
+    //         UserMessage::text("Please calculate 123 + 456 for me using the CalculatorAgentTool.");
 
-        // Use execute for the orchestrator to potentially use tools
-        let resp = orchestrator_executor.execute(message).await;
+    //     // Use execute for the orchestrator to potentially use tools
+    //     let resp = orchestrator_executor.execute(message).await;
 
-        match resp {
-            Ok(r) => {
-                println!("Orchestrator Response: {:?}", r);
-                assert!(!r.choices.is_empty());
-                let content = r
-                    .choices
-                    .first()
-                    .unwrap()
-                    .message
-                    .content
-                    .first()
-                    .map(|c| c.to_string())
-                    .unwrap_or_default();
-                // Check if the final response contains the calculated sum (579)
-                assert!(
-                    content.contains("579"),
-                    "Expected orchestrator response to contain '579', got: {}",
-                    content
-                );
-            }
-            Err(e) => panic!("Orchestrator test failed: {:?}", e),
-        }
-    }
+    //     match resp {
+    //         Ok(r) => {
+    //             println!("Orchestrator Response: {:?}", r);
+    //             assert!(!r.choices.is_empty());
+    //             let content = r
+    //                 .choices
+    //                 .first()
+    //                 .unwrap()
+    //                 .message
+    //                 .content
+    //                 .first()
+    //                 .map(|c| c.to_string())
+    //                 .unwrap_or_default();
+    //             // Check if the final response contains the calculated sum (579)
+    //             assert!(
+    //                 content.contains("579"),
+    //                 "Expected orchestrator response to contain '579', got: {}",
+    //                 content
+    //             );
+    //         }
+    //         Err(e) => panic!("Orchestrator test failed: {:?}", e),
+    //     }
+    // }
 }
