@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     future::Future,
-    marker::PhantomData,
     sync::{Arc, RwLock},
 };
 
@@ -209,7 +208,7 @@ pub trait AnyTool: Send + Sync {
 }
 
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub trait Tool: Send + Sync + 'static {
     type Input: JsonSchema + DeserializeOwned + Send + Sync;
     type Error: ToString;
     fn name(&self) -> &str;
@@ -328,41 +327,41 @@ where
 //     }
 // }
 
-#[async_trait]
-impl<I, O, E, Fut> Tool for SimpleTool<I, O, E, Fut>
-where
-    I: JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
-    O: Serialize,
-    E: ToString,
-    Fut: Future<Output = Result<O, E>> + Send + 'static,
-{
-    type Input = I;
-    type Error = String;
+// #[async_trait]
+// impl<I, O, E, Fut> Tool for SimpleTool<I, O, E, Fut>
+// where
+//     I: JsonSchema + Serialize + DeserializeOwned + Send + Sync + 'static,
+//     O: Serialize,
+//     E: ToString,
+//     Fut: Future<Output = Result<O, E>> + Send + 'static,
+// {
+//     type Input = I;
+//     type Error = String;
 
-    fn name(&self) -> &str {
-        &self.name
-    }
+//     fn name(&self) -> &str {
+//         &self.name
+//     }
 
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
+//     fn description(&self) -> Option<&str> {
+//         self.description.as_deref()
+//     }
 
-    async fn invoke(
-        &self,
-        tool_call_id: &str,
-        input: Self::Input,
-    ) -> Result<Messages, Self::Error> {
-        match (self.handler)(input).await {
-            Ok(content) => {
-                let serialized = serde_json::to_string(&content)
-                    .map_err(|e| format!("Failed to serialize output: {}", e))?;
+//     async fn invoke(
+//         &self,
+//         tool_call_id: &str,
+//         input: Self::Input,
+//     ) -> Result<Messages, Self::Error> {
+//         match (self.handler)(input).await {
+//             Ok(content) => {
+//                 let serialized = serde_json::to_string(&content)
+//                     .map_err(|e| format!("Failed to serialize output: {}", e))?;
 
-                Ok(ToolMessage::new(tool_call_id, serialized).into())
-            }
-            Err(err) => Err(err.to_string()),
-        }
-    }
-}
+//                 Ok(ToolMessage::new(tool_call_id, serialized).into())
+//             }
+//             Err(err) => Err(err.to_string()),
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {

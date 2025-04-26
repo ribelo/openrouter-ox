@@ -50,7 +50,7 @@ pub enum AgentErrorSerializable {
     ResponseParsingError(String),
 
     #[error("Agent reached maximum iterations ({limit}) without completing task")]
-    MaxIterationsReached { limit: usize },
+    MaxIterationsReached { limit: u32 },
 
     #[error("Tool execution failed: {0}")]
     ToolError(String),

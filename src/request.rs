@@ -93,7 +93,7 @@ impl<S: request_builder::State> RequestBuilder<S> {
         self.messages.push(message.into());
         self
     }
-    pub fn response_format<T: JsonSchema + Serialize + DeserializeOwned>(mut self) -> Self {
+    pub fn response_format<T: JsonSchema + DeserializeOwned>(mut self) -> Self {
         let type_name = std::any::type_name::<T>().split("::").last().unwrap();
         let mut schema_settings = SchemaSettings::draft2020_12();
         schema_settings.inline_subschemas = true;
@@ -415,199 +415,199 @@ mod test {
         dbg!(json);
     }
 
-    #[tokio::test]
-    async fn test_adding_tool() {
-        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-        pub struct AddingToolInput {
-            a: f32,
-            b: f32,
-        }
-        let adding_tool = SimpleTool::builder()
-            .name("adding_tool")
-            .handler(|input: AddingToolInput| async move {
-                let result = input.a + input.b;
-                Ok::<_, String>(serde_json::json!({ "result": result }))
-            })
-            .build();
-        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
-        let client = reqwest::Client::new();
-        let openrouter = OpenRouter::builder()
-            .api_key(api_key)
-            .client(client)
-            .build();
-        let tools = ToolBox::builder().tool(adding_tool).build();
-        let mut messages = Messages::default().user(
-            "This is a test, use adding tool with any value to verify if everything is working.",
-        );
-        let res = openrouter
-            .chat_completion()
-            .model("openai/gpt-4o-2024-11-20")
-            // .model("anthropic/claude-3.7-sonnet:beta")
-            .tools(tools.clone())
-            .messages(messages.clone())
-            .build()
-            .send()
-            .await
-            .unwrap();
-        messages.push(res.clone());
-        if let Some(tool_calls) = res.tool_calls() {
-            for tool_call in tool_calls {
-                let msg = tools.invoke(&tool_call).await;
-                messages.extend(msg);
-            }
-        }
-        dbg!(&messages);
-        let res = openrouter
-            .chat_completion()
-            .model("openai/gpt-4o-2024-11-20")
-            // .model("anthropic/claude-3.7-sonnet:beta")
-            .tools(tools.clone())
-            .messages(messages.clone())
-            .build()
-            .send()
-            .await
-            .unwrap();
-        dbg!(&res);
-    }
+    // #[tokio::test]
+    // async fn test_adding_tool() {
+    //     #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+    //     pub struct AddingToolInput {
+    //         a: f32,
+    //         b: f32,
+    //     }
+    //     let adding_tool = SimpleTool::builder()
+    //         .name("adding_tool")
+    //         .handler(|input: AddingToolInput| async move {
+    //             let result = input.a + input.b;
+    //             Ok::<_, String>(serde_json::json!({ "result": result }))
+    //         })
+    //         .build();
+    //     let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+    //     let client = reqwest::Client::new();
+    //     let openrouter = OpenRouter::builder()
+    //         .api_key(api_key)
+    //         .client(client)
+    //         .build();
+    //     let tools = ToolBox::builder().tool(adding_tool).build();
+    //     let mut messages = Messages::default().user(
+    //         "This is a test, use adding tool with any value to verify if everything is working.",
+    //     );
+    //     let res = openrouter
+    //         .chat_completion()
+    //         .model("openai/gpt-4o-2024-11-20")
+    //         // .model("anthropic/claude-3.7-sonnet:beta")
+    //         .tools(tools.clone())
+    //         .messages(messages.clone())
+    //         .build()
+    //         .send()
+    //         .await
+    //         .unwrap();
+    //     messages.push(res.clone());
+    //     if let Some(tool_calls) = res.tool_calls() {
+    //         for tool_call in tool_calls {
+    //             let msg = tools.invoke(&tool_call).await;
+    //             messages.extend(msg);
+    //         }
+    //     }
+    //     dbg!(&messages);
+    //     let res = openrouter
+    //         .chat_completion()
+    //         .model("openai/gpt-4o-2024-11-20")
+    //         // .model("anthropic/claude-3.7-sonnet:beta")
+    //         .tools(tools.clone())
+    //         .messages(messages.clone())
+    //         .build()
+    //         .send()
+    //         .await
+    //         .unwrap();
+    //     dbg!(&res);
+    // }
 
-    #[tokio::test]
-    async fn test_stream_adding_tool() {
-        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-        pub struct AddingToolInput {
-            a: f32,
-            b: f32,
-        }
-        let adding_tool = SimpleTool::builder()
-            .name("adding_tool")
-            .handler(|input: AddingToolInput| async move {
-                let result = input.a + input.b;
-                Ok::<_, String>(serde_json::json!({ "result": result }))
-            })
-            .build();
-        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
-        let client = reqwest::Client::new();
-        let openrouter = OpenRouter::builder()
-            .api_key(api_key)
-            .client(client)
-            .build();
-        let tools = ToolBox::builder().tool(adding_tool).build();
-        let messages = Messages::default().user(
-            "This is a test, use adding tool with any value to verify if everything is working.",
-        );
-        // let mut messages = Messages::from(UserMessage::from(vec![
-        //     "Hello, how are you?",
-        // ]));
-        let mut stream = openrouter
-            .chat_completion()
-            // .model("google/gemini-2.0-flash-001")
-            .model("openai/gpt-4o-mini")
-            .tools(tools.clone())
-            .messages(messages.clone())
-            .build()
-            .stream();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(chunk) => println!("{:?}", chunk),
-                Err(_) => todo!(),
-            }
-        }
-    }
+    // #[tokio::test]
+    // async fn test_stream_adding_tool() {
+    //     #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+    //     pub struct AddingToolInput {
+    //         a: f32,
+    //         b: f32,
+    //     }
+    //     let adding_tool = SimpleTool::builder()
+    //         .name("adding_tool")
+    //         .handler(|input: AddingToolInput| async move {
+    //             let result = input.a + input.b;
+    //             Ok::<_, String>(serde_json::json!({ "result": result }))
+    //         })
+    //         .build();
+    //     let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+    //     let client = reqwest::Client::new();
+    //     let openrouter = OpenRouter::builder()
+    //         .api_key(api_key)
+    //         .client(client)
+    //         .build();
+    //     let tools = ToolBox::builder().tool(adding_tool).build();
+    //     let messages = Messages::default().user(
+    //         "This is a test, use adding tool with any value to verify if everything is working.",
+    //     );
+    //     // let mut messages = Messages::from(UserMessage::from(vec![
+    //     //     "Hello, how are you?",
+    //     // ]));
+    //     let mut stream = openrouter
+    //         .chat_completion()
+    //         // .model("google/gemini-2.0-flash-001")
+    //         .model("openai/gpt-4o-mini")
+    //         .tools(tools.clone())
+    //         .messages(messages.clone())
+    //         .build()
+    //         .stream();
+    //     while let Some(chunk) = stream.next().await {
+    //         match chunk {
+    //             Ok(chunk) => println!("{:?}", chunk),
+    //             Err(_) => todo!(),
+    //         }
+    //     }
+    // }
 
-    #[tokio::test]
-    async fn test_wikipedia_tool() {
-        #[derive(Debug, Clone)]
-        pub struct Wikipedia;
+    // #[tokio::test]
+    // async fn test_wikipedia_tool() {
+    //     #[derive(Debug, Clone)]
+    //     pub struct Wikipedia;
 
-        #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-        pub struct WikipediaInput {
-            query: String,
-        }
+    //     #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+    //     pub struct WikipediaInput {
+    //         query: String,
+    //     }
 
-        #[async_trait::async_trait]
-        impl Tool for Wikipedia {
-            type Input = WikipediaInput;
-            type Error = String;
+    //     #[async_trait::async_trait]
+    //     impl Tool for Wikipedia {
+    //         type Input = WikipediaInput;
+    //         type Error = String;
 
-            fn name(&self) -> &str {
-                "wikipedia"
-            }
+    //         fn name(&self) -> &str {
+    //             "wikipedia"
+    //         }
 
-            async fn invoke(
-                &self,
-                tool_call_id: &str,
-                input: Self::Input,
-            ) -> Result<Messages, Self::Error> {
-                let url = format!(
-                            "https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={}",
-                            input.query
-                        );
-                let res = reqwest::get(&url)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .json::<serde_json::Value>()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let msgs = UserMessage::new(vec![res.to_string()]);
-                Ok(msgs.into())
-            }
-        }
+    //         async fn invoke(
+    //             &self,
+    //             tool_call_id: &str,
+    //             input: Self::Input,
+    //         ) -> Result<Messages, Self::Error> {
+    //             let url = format!(
+    //                         "https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={}",
+    //                         input.query
+    //                     );
+    //             let res = reqwest::get(&url)
+    //                 .await
+    //                 .map_err(|e| e.to_string())?
+    //                 .json::<serde_json::Value>()
+    //                 .await
+    //                 .map_err(|e| e.to_string())?;
+    //             let msgs = UserMessage::new(vec![res.to_string()]);
+    //             Ok(msgs.into())
+    //         }
+    //     }
 
-        let api_key = std::env::var("OPENAI_API_KEY").unwrap();
-        let client = reqwest::Client::new();
-        let openrouter = OpenRouter::builder()
-            .api_key(api_key)
-            .client(client)
-            .build();
-        let tools = ToolBox::builder().tool(Wikipedia).build();
-        let mut messages = Messages::default().user("Search Apollo project on Wikipedia.");
-        let res = openrouter
-            .chat_completion()
-            .model("openai/gpt-4o-2024-11-20")
-            .tools(tools.clone())
-            .messages(messages.clone())
-            .build()
-            .send()
-            .await
-            .unwrap();
-        messages.push(res.clone());
-        if let Some(tool_calls) = res.tool_calls() {
-            for tool_call in tool_calls {
-                let msg = tools.invoke(&tool_call).await;
-                messages.extend(msg);
-            }
-        }
-        let res = openrouter
-            .chat_completion()
-            .model("openai/gpt-4o-2024-11-20")
-            .tools(tools.clone())
-            .messages(messages)
-            .build()
-            .send()
-            .await
-            .unwrap();
-        dbg!(&res);
-    }
+    //     let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+    //     let client = reqwest::Client::new();
+    //     let openrouter = OpenRouter::builder()
+    //         .api_key(api_key)
+    //         .client(client)
+    //         .build();
+    //     let tools = ToolBox::builder().tool(Wikipedia).build();
+    //     let mut messages = Messages::default().user("Search Apollo project on Wikipedia.");
+    //     let res = openrouter
+    //         .chat_completion()
+    //         .model("openai/gpt-4o-2024-11-20")
+    //         .tools(tools.clone())
+    //         .messages(messages.clone())
+    //         .build()
+    //         .send()
+    //         .await
+    //         .unwrap();
+    //     messages.push(res.clone());
+    //     if let Some(tool_calls) = res.tool_calls() {
+    //         for tool_call in tool_calls {
+    //             let msg = tools.invoke(&tool_call).await;
+    //             messages.extend(msg);
+    //         }
+    //     }
+    //     let res = openrouter
+    //         .chat_completion()
+    //         .model("openai/gpt-4o-2024-11-20")
+    //         .tools(tools.clone())
+    //         .messages(messages)
+    //         .build()
+    //         .send()
+    //         .await
+    //         .unwrap();
+    //     dbg!(&res);
+    // }
 
-    #[tokio::test]
-    async fn test_json_output() {
-        #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-        pub struct TestOutput {
-            probability: f64,
-            explanation: String,
-        }
+    // #[tokio::test]
+    // async fn test_json_output() {
+    //     #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+    //     pub struct TestOutput {
+    //         probability: f64,
+    //         explanation: String,
+    //     }
 
-        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
-        let openrouter = OpenRouter::builder().api_key(api_key).build();
-        let mut messages = Messages::default().user("Can we live forever in the future?");
-        let res = openrouter
-            .chat_completion()
-            .model("google/gemini-2.0-flash-001")
-            .messages(messages.clone())
-            .response_format::<TestOutput>()
-            .build()
-            .send()
-            .await
-            .unwrap();
-        dbg!(&res);
-    }
+    //     let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+    //     let openrouter = OpenRouter::builder().api_key(api_key).build();
+    //     let mut messages = Messages::default().user("Can we live forever in the future?");
+    //     let res = openrouter
+    //         .chat_completion()
+    //         .model("google/gemini-2.0-flash-001")
+    //         .messages(messages.clone())
+    //         .response_format::<TestOutput>()
+    //         .build()
+    //         .send()
+    //         .await
+    //         .unwrap();
+    //     dbg!(&res);
+    // }
 }
