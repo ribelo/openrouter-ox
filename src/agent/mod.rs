@@ -28,7 +28,9 @@ use crate::{
 };
 
 #[derive(Clone, Builder)]
-pub struct Agent {
+pub struct Agent<S: Clone + Send + Sync + 'static> {
+    #[builder(into, start_fn)]
+    pub state: Arc<S>,
     #[builder(field)]
     pub context: AgentContext,
     #[builder(field)]
@@ -49,7 +51,7 @@ pub struct Agent {
     pub max_iterations: u32,
 }
 
-impl<S: agent_builder::State> AgentBuilder<S> {
+impl<S: Clone + Send + Sync + 'static, BS: agent_builder::State> AgentBuilder<S, BS> {
     pub fn tools(mut self, toolbox: ToolBox) -> Self {
         self.context.tools = Some(toolbox);
         self
@@ -71,8 +73,8 @@ impl<S: agent_builder::State> AgentBuilder<S> {
     }
 }
 
-impl<S: agent_builder::IsComplete> AgentBuilder<S> {
-    pub fn typed<O: JsonSchema + DeserializeOwned>(self) -> TypedAgent<O> {
+impl<S: Clone + Send + Sync + 'static, BS: agent_builder::IsComplete> AgentBuilder<S, BS> {
+    pub fn typed<O: JsonSchema + DeserializeOwned>(self) -> TypedAgent<S, O> {
         TypedAgent {
             agent: self.build(),
             _phantom: PhantomData,
@@ -81,13 +83,13 @@ impl<S: agent_builder::IsComplete> AgentBuilder<S> {
 }
 
 #[derive(Clone, Deref)]
-pub struct TypedAgent<O: JsonSchema + DeserializeOwned> {
+pub struct TypedAgent<S: Clone + Send + Sync + 'static, O: JsonSchema + DeserializeOwned> {
     #[deref]
-    agent: Agent,
+    agent: Agent<S>,
     _phantom: PhantomData<O>,
 }
 
-impl Agent {
+impl<S: Clone + Send + Sync> Agent<S> {
     pub async fn generate(
         &self,
         messages: impl Into<Messages> + Send,
@@ -385,8 +387,9 @@ impl Agent {
     }
 }
 
-impl<O> TypedAgent<O>
+impl<S, O> TypedAgent<S, O>
 where
+    S: Clone + Send + Sync + 'static,
     O: JsonSchema + DeserializeOwned,
 {
     /// Gets a single, structured response of type `Output` from one call to the LLM.
@@ -494,7 +497,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use tokio_stream::StreamExt;
 
     use crate::{
@@ -505,7 +507,6 @@ mod tests {
     };
 
     use super::*;
-    use std::sync::Arc;
 
     #[derive(Debug, schemars::JsonSchema, serde::Serialize, serde::Deserialize)]
     struct CalculatorToolInput {
@@ -666,7 +667,7 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_simple_agent_execute() {
         let openrouter = create_openrouter();
-        let agent = Agent::builder()
+        let agent = Agent::builder(())
             .openrouter(openrouter)
             .name("CalculatorAgent")
             .description("An agent that performs calculator operations")
@@ -706,7 +707,7 @@ mod tests {
     async fn test_simple_typed_agent_generate() {
         let openrouter = create_openrouter();
         // Create the typed agent executor
-        let agent = Agent::builder()
+        let agent = Agent::builder(())
                     .openrouter(openrouter)
                     .name("CalculatorAgent")
                     .description("An agent that performs calculator operations")
@@ -741,7 +742,7 @@ mod tests {
     async fn test_simple_typed_agent_execute() {
         let openrouter = create_openrouter();
         // Create the typed agent executor
-        let agent = Agent::builder()
+        let agent = Agent::builder(())
                     .openrouter(openrouter)
                     .name("CalculatorAgent")
                     .description("An agent that performs calculator operations")
@@ -776,7 +777,7 @@ mod tests {
     #[ignore] // Ignored by default to avoid making API calls unless explicitly run
     async fn test_agent_stream_events() {
         let openrouter = create_openrouter();
-        let agent = Agent::builder()
+        let agent = Agent::builder(())
                     .openrouter(openrouter)
                     .name("CalculatorAgent")
                     .description("An agent that performs calculator operations")
