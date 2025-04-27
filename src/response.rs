@@ -14,6 +14,8 @@ pub enum FinishReason {
     Limit,
     ContentFilter,
     ToolCalls,
+    #[serde(alias = "length", alias = "LENGTH")]
+    Length,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

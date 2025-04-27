@@ -433,8 +433,6 @@ where
             .send()
             .await?; // Converts ApiRequestError to AgentError
 
-        dbg!(&resp);
-
         // Extract the response content
         let json_str = resp
             .choices
