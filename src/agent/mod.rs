@@ -15,6 +15,7 @@ use context::AgentContext;
 use derive_more::Deref;
 pub use error::AgentError;
 pub use events::{AgentErrorSerializable, AgentEvent};
+use futures::stream::BoxStream;
 use futures_util::{Stream, TryStreamExt};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -131,10 +132,11 @@ impl<S: Clone + Send + Sync> Agent<S> {
     /// Streams the parts (chunks) of a single `GenerateContentResponse` from one call to the LLM.
     /// Makes a single, streaming call to the underlying model API.
     /// Yields `Result<GenerateContentResponse, AgentError>` items representing the chunks.
-    pub fn stream_response<'a>(
-        &'a self,
+    pub fn stream_response(
+        & self,
         messages: impl Into<Messages> + Send,
-    ) -> Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, AgentError>> + Send>> {
+    // ) -> Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, AgentError>> + Send>> {
+    ) -> BoxStream<'static, Result<ChatCompletionChunk, AgentError>> {
         let messages = messages.into();
         let mut combined_messages = Messages::default();
 
