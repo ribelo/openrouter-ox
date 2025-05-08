@@ -81,7 +81,7 @@ impl ImageContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text(TextContent),
-    Image(ImageContent),
+    ImageUrl(ImageContent),
 }
 
 impl ContentPart {
@@ -94,7 +94,7 @@ impl ContentPart {
 
     pub fn as_image(&self) -> Option<&ImageContent> {
         match self {
-            ContentPart::Image(image) => Some(image),
+            ContentPart::ImageUrl(image) => Some(image),
             _ => None,
         }
     }
@@ -174,7 +174,7 @@ impl SystemMessage {
     /// Create a system message with a single image part
     pub fn image(image: ImageContent) -> Self {
         Self {
-            content: Content(vec![ContentPart::Image(image)]),
+            content: Content(vec![ContentPart::ImageUrl(image)]),
             name: None,
         }
     }
@@ -182,7 +182,7 @@ impl SystemMessage {
     /// Create a system message with a single image URL part
     pub fn image_url(url: impl Into<String>) -> Self {
         Self {
-            content: Content(vec![ContentPart::Image(ImageContent::new(url))]),
+            content: Content(vec![ContentPart::ImageUrl(ImageContent::new(url))]),
             name: None,
         }
     }
@@ -266,7 +266,7 @@ impl UserMessage {
     #[must_use]
     pub fn image(image: ImageContent) -> Self {
         Self {
-            content: Content(vec![ContentPart::Image(image)]),
+            content: Content(vec![ContentPart::ImageUrl(image)]),
             name: None,
         }
     }
@@ -275,7 +275,7 @@ impl UserMessage {
     #[must_use]
     pub fn image_url(url: impl Into<String>) -> Self {
         Self {
-            content: Content(vec![ContentPart::Image(ImageContent::new(url))]),
+            content: Content(vec![ContentPart::ImageUrl(ImageContent::new(url))]),
             name: None,
         }
     }
@@ -375,7 +375,7 @@ impl AssistantMessage {
     #[must_use]
     pub fn image(image: ImageContent) -> Self {
         Self {
-            content: Content(vec![ContentPart::Image(image)]),
+            content: Content(vec![ContentPart::ImageUrl(image)]),
             name: None,
             tool_calls: None,
             refusal: None,
@@ -386,7 +386,7 @@ impl AssistantMessage {
     #[must_use]
     pub fn image_url(url: impl Into<String>) -> Self {
         Self {
-            content: Content(vec![ContentPart::Image(ImageContent::new(url))]),
+            content: Content(vec![ContentPart::ImageUrl(ImageContent::new(url))]),
             name: None,
             tool_calls: None,
             refusal: None,

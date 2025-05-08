@@ -204,7 +204,9 @@ mod test {
     use tokio_stream::StreamExt;
 
     use crate::{
-        message::{Messages, UserMessage},
+        message::{
+            Content, ContentPart, ImageContent, ImageUrl, Messages, TextContent, UserMessage,
+        },
         tool::{SimpleTool, Tool, ToolBox},
         OpenRouter,
     };
@@ -247,6 +249,59 @@ mod test {
             .chat_completion()
             .model("google/gemini-2.0-flash-001")
             .message(UserMessage::text("Hi, I'm John."))
+            .build()
+            .send()
+            .await;
+        dbg!(&res);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_image_request() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+        let client = reqwest::Client::new();
+        let openrouter = OpenRouter::builder()
+            .api_key(api_key)
+            .client(client)
+            .build();
+
+        // 1. Read image bytes
+        let image_bytes = std::fs::read(
+            "/home/ribelo/downloads/800px-Harmonia_axyridis_from_above.jpg",
+        )
+        .expect("Failed to read image file. Make sure the path is correct and the file exists.");
+
+        // 2. Determine MIME type (e.g., from file extension or magic bytes)
+        // For this example, we'll hardcode based on the .jpg extension.
+        let mime_type = "image/jpeg";
+
+        // 3. Base64 encode the image bytes
+        let base64_encoded_image = STANDARD.encode(&image_bytes);
+
+        // 4. Construct the data URL
+        let data_url = format!("data:{};base64,{}", mime_type, base64_encoded_image);
+
+        // 5. Send the request
+        // Assuming UserMessage::image_url takes the image URL as its argument.
+        // The original text "Hi, I'm John." is replaced by the data_url.
+        // If a text prompt is needed alongside the image, UserMessage would need
+        // to support multipart content, or separate text and image messages would be sent.
+        let res = openrouter
+            .chat_completion()
+            .model("google/gemini-2.5-flash-preview") // Or any model that supports image input
+            .message(UserMessage::new(vec![
+                ContentPart::ImageUrl(ImageContent {
+                    image_url: ImageUrl {
+                        url: data_url,
+                        detail: None,
+                    },
+                }),
+                ContentPart::Text(TextContent {
+                    text: "what is on this image?".to_string(),
+                }),
+            ])) // Pass the data URL
             .build()
             .send()
             .await;
